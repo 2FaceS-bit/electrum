@@ -33,10 +33,11 @@ import binascii
 import base64
 import asyncio
 import inspect
+from asyncio import CancelledError
 from collections import defaultdict
 from functools import wraps
 from decimal import Decimal, InvalidOperation
-from typing import Optional, TYPE_CHECKING, Dict, List, Any
+from typing import Optional, TYPE_CHECKING, Dict, List, Any, Union
 import os
 import re
 
@@ -44,8 +45,10 @@ import electrum_ecc as ecc
 
 from . import util
 from .lnmsg import OnionWireSerializer
+from .lnworker import LN_P2P_NETWORK_TIMEOUT
 from .logging import Logger
 from .onion_message import create_blinded_path, send_onion_message_to
+from .submarine_swaps import NostrTransport
 from .util import (
     bfh, json_decode, json_normalize, is_hash256_str, is_hex_str, to_bytes, parse_max_spend, to_decimal,
     UserFacingException, InvalidPassword
@@ -67,7 +70,7 @@ from .wallet import (
 )
 from .address_synchronizer import TX_HEIGHT_LOCAL
 from .mnemonic import Mnemonic
-from .lnutil import (channel_id_from_funding_tx, LnFeatures, SENT, MIN_FINAL_CLTV_DELTA_FOR_INVOICE,
+from .lnutil import (channel_id_from_funding_tx, LnFeatures, SENT, MIN_FINAL_CLTV_DELTA_ACCEPTED,
                      PaymentFeeBudget, NBLOCK_CLTV_DELTA_TOO_FAR_INTO_FUTURE)
 from .plugin import run_hook, DeviceMgr, Plugins
 from .version import ELECTRUM_VERSION
@@ -100,14 +103,20 @@ def satoshis(amount):
     return int(COIN*to_decimal(amount)) if amount is not None else None
 
 
-def format_satoshis(x):
-    return str(to_decimal(x)/COIN) if x is not None else None
+def format_satoshis(x: Union[float, int, Decimal, None]) -> Optional[str]:
+    """
+    input: satoshis as a Number
+    output: str formatted as bitcoin amount
+    """
+    if x is None:
+        return None
+    return util.format_satoshis_plain(x, is_max_allowed=False)
 
 
 class Command:
     def __init__(self, func, name, s):
         self.name = name
-        self.requires_network = 'n' in s
+        self.requires_network = 'n' in s  # better name would be "requires daemon"
         self.requires_wallet = 'w' in s
         self.requires_password = 'p' in s
         self.requires_lightning = 'l' in s
@@ -475,7 +484,7 @@ class Commands(Logger):
         for txin in wallet.get_utxos():
             d = txin.to_json()
             v = d.pop("value_sats")
-            d["value"] = str(to_decimal(v)/COIN) if v is not None else None
+            d["value"] = format_satoshis(v)
             coins.append(d)
         return coins
 
@@ -718,13 +727,13 @@ class Commands(Logger):
         """Return the balance of your wallet. """
         c, u, x = wallet.get_balance()
         l = wallet.lnworker.get_balance() if wallet.lnworker else None
-        out = {"confirmed": str(to_decimal(c)/COIN)}
+        out = {"confirmed": format_satoshis(c)}
         if u:
-            out["unconfirmed"] = str(to_decimal(u)/COIN)
+            out["unconfirmed"] = format_satoshis(u)
         if x:
-            out["unmatured"] = str(to_decimal(x)/COIN)
+            out["unmatured"] = format_satoshis(x)
         if l:
-            out["lightning"] = str(to_decimal(l)/COIN)
+            out["lightning"] = format_satoshis(l)
         return out
 
     @command('n')
@@ -737,8 +746,8 @@ class Commands(Logger):
         """
         sh = bitcoin.address_to_scripthash(address)
         out = await self.network.get_balance_for_scripthash(sh)
-        out["confirmed"] =  str(to_decimal(out["confirmed"])/COIN)
-        out["unconfirmed"] =  str(to_decimal(out["unconfirmed"])/COIN)
+        out["confirmed"] = format_satoshis(out["confirmed"])
+        out["unconfirmed"] = format_satoshis(out["unconfirmed"])
         return out
 
     @command('n')
@@ -871,8 +880,8 @@ class Commands(Logger):
 
         arg:str:privkey:Private key. Type \'?\' to get a prompt.
         arg:str:destination:Bitcoin address, contact or alias
-        arg:str:fee:Transaction fee (absolute, in BTC)
-        arg:str:feerate:Transaction fee rate (in sat/vbyte)
+        arg:decimal:fee:Transaction fee (absolute, in BTC)
+        arg:decimal:feerate:Transaction fee rate (in sat/vbyte)
         arg:int:imax:Maximum number of inputs
         arg:bool:nocheck:Do not verify aliases
         """
@@ -916,15 +925,15 @@ class Commands(Logger):
         message = util.to_bytes(message)
         return bitcoin.verify_usermessage_with_address(address, sig, message)
 
-    def _get_fee_policy(self, fee, feerate):
+    def _get_fee_policy(self, fee: str, feerate: str):
         if fee is not None and feerate is not None:
             raise Exception('Cannot set both fee and feerate')
         if fee is not None:
             fee_sats = satoshis(fee)
             fee_policy = FeePolicy(f'fixed:{fee_sats}')
         elif feerate is not None:
-            feerate_per_byte = 1000 * feerate
-            fee_policy = FeePolicy(f'feerate:{feerate_per_byte}')
+            sat_per_kvbyte = int(1000 * to_decimal(feerate))
+            fee_policy = FeePolicy(f'feerate:{sat_per_kvbyte}')
         else:
             fee_policy = FeePolicy(self.config.FEE_POLICY)
         return fee_policy
@@ -937,7 +946,7 @@ class Commands(Logger):
         arg:str:destination:Bitcoin address, contact or alias
         arg:decimal_or_max:amount:Amount to be sent (in BTC). Type '!' to send the maximum available.
         arg:decimal:fee:Transaction fee (absolute, in BTC)
-        arg:float:feerate:Transaction fee rate (in sat/vbyte)
+        arg:decimal:feerate:Transaction fee rate (in sat/vbyte)
         arg:str:from_addr:Source address (must be a wallet address; use sweep to spend from non-wallet address)
         arg:str:change_addr:Change address. Default is a spare address, or the source address if it's not in the wallet
         arg:bool:rbf:Whether to signal opt-in Replace-By-Fee in the transaction (true/false)
@@ -970,8 +979,8 @@ class Commands(Logger):
 
         arg:json:outputs:json list of ["address", "amount in BTC"]
         arg:bool:rbf:Whether to signal opt-in Replace-By-Fee in the transaction (true/false)
-        arg:str:fee:Transaction fee (absolute, in BTC)
-        arg:str:feerate:Transaction fee rate (in sat/vbyte)
+        arg:decimal:fee:Transaction fee (absolute, in BTC)
+        arg:decimal:feerate:Transaction fee rate (in sat/vbyte)
         arg:str:from_addr:Source address (must be a wallet address; use sweep to spend from non-wallet address)
         arg:str:change_addr:Change address. Default is a spare address, or the source address if it's not in the wallet
         arg:bool:addtransaction:Whether transaction is to be used for broadcasting afterwards. Adds transaction to the wallet
@@ -1182,7 +1191,7 @@ class Commands(Logger):
             if labels or balance:
                 item = (item,)
             if balance:
-                item += (util.format_satoshis(sum(wallet.get_addr_balance(addr))),)
+                item += (format_satoshis(sum(wallet.get_addr_balance(addr))),)
             if labels:
                 item += (repr(wallet.get_label_for_address(addr)),)
             out.append(item)
@@ -1375,7 +1384,7 @@ class Commands(Logger):
             amount: Optional[Decimal] = None,
             memo: str = "",
             expiry: int = 3600,
-            min_final_cltv_expiry_delta: int = MIN_FINAL_CLTV_DELTA_FOR_INVOICE * 2,
+            min_final_cltv_expiry_delta: int = MIN_FINAL_CLTV_DELTA_ACCEPTED * 2,
             wallet: Abstract_Wallet = None
     ) -> dict:
         """
@@ -1392,23 +1401,23 @@ class Commands(Logger):
         assert payment_hash not in wallet.lnworker.payment_info, "Payment hash already used!"
         assert payment_hash not in wallet.lnworker.dont_settle_htlcs, "Payment hash already used!"
         assert wallet.lnworker.get_preimage(bfh(payment_hash)) is None, "Already got a preimage for this payment hash!"
-        assert MIN_FINAL_CLTV_DELTA_FOR_INVOICE < min_final_cltv_expiry_delta < 576, "Use a sane min_final_cltv_expiry_delta value"
+        assert MIN_FINAL_CLTV_DELTA_ACCEPTED < min_final_cltv_expiry_delta < 576, "Use a sane min_final_cltv_expiry_delta value"
         amount = amount if amount and satoshis(amount) > 0 else None  # make amount either >0 or None
         inbound_capacity = wallet.lnworker.num_sats_can_receive()
         assert inbound_capacity > satoshis(amount or 0), \
             f"Not enough inbound capacity [{inbound_capacity} sat] to receive this payment"
 
-        lnaddr, invoice = wallet.lnworker.get_bolt11_invoice(
-            payment_hash=bfh(payment_hash),
-            amount_msat=satoshis(amount) * 1000 if amount else None,
-            message=memo,
-            expiry=expiry,
-            min_final_cltv_expiry_delta=min_final_cltv_expiry_delta,
-            fallback_address=None
-        )
         wallet.lnworker.add_payment_info_for_hold_invoice(
             bfh(payment_hash),
-            satoshis(amount) if amount else None,
+            lightning_amount_sat=satoshis(amount) if amount else None,
+            min_final_cltv_delta=min_final_cltv_expiry_delta,
+            exp_delay=expiry,
+        )
+        info = wallet.lnworker.get_payment_info(bfh(payment_hash))
+        lnaddr, invoice = wallet.lnworker.get_bolt11_invoice(
+            payment_info=info,
+            message=memo,
+            fallback_address=None
         )
         wallet.lnworker.dont_settle_htlcs[payment_hash] = None
         wallet.set_label(payment_hash, memo)
@@ -1431,7 +1440,7 @@ class Commands(Logger):
         assert payment_hash in wallet.lnworker.payment_info, \
             f"Couldn't find lightning invoice for {payment_hash=}"
         assert payment_hash in wallet.lnworker.dont_settle_htlcs, f"Invoice {payment_hash=} not a hold invoice?"
-        assert wallet.lnworker.is_accepted_mpp(bfh(payment_hash)), \
+        assert wallet.lnworker.is_complete_mpp(bfh(payment_hash)), \
             f"MPP incomplete, cannot settle hold invoice {payment_hash} yet"
         info: Optional['PaymentInfo'] = wallet.lnworker.get_payment_info(bfh(payment_hash))
         assert (wallet.lnworker.get_payment_mpp_amount_msat(bfh(payment_hash)) or 0) >= (info.amount_msat or 0)
@@ -1458,7 +1467,7 @@ class Commands(Logger):
         wallet.lnworker.set_payment_status(bfh(payment_hash), PR_UNPAID)
         wallet.lnworker.delete_payment_info(payment_hash)
         wallet.set_label(payment_hash, None)
-        while wallet.lnworker.is_accepted_mpp(bfh(payment_hash)):
+        while wallet.lnworker.is_complete_mpp(bfh(payment_hash)):
             # wait until the htlcs got failed so the payment won't get settled accidentally in a race
             await asyncio.sleep(0.1)
         del wallet.lnworker.dont_settle_htlcs[payment_hash]
@@ -1483,7 +1492,7 @@ class Commands(Logger):
         """
         assert len(payment_hash) == 64, f"Invalid payment_hash length: {len(payment_hash)} != 64"
         info: Optional['PaymentInfo'] = wallet.lnworker.get_payment_info(bfh(payment_hash))
-        is_accepted_mpp: bool = wallet.lnworker.is_accepted_mpp(bfh(payment_hash))
+        is_complete_mpp: bool = wallet.lnworker.is_complete_mpp(bfh(payment_hash))
         amount_sat = (wallet.lnworker.get_payment_mpp_amount_msat(bfh(payment_hash)) or 0) // 1000
         result = {
             "status": "unknown",
@@ -1491,10 +1500,10 @@ class Commands(Logger):
         }
         if info is None:
             pass
-        elif not is_accepted_mpp and not wallet.lnworker.get_preimage_hex(payment_hash):
-            # is_accepted_mpp is False for settled payments
+        elif not is_complete_mpp and not wallet.lnworker.get_preimage_hex(payment_hash):
+            # is_complete_mpp is False for settled payments
             result["status"] = "unpaid"
-        elif is_accepted_mpp and payment_hash in wallet.lnworker.dont_settle_htlcs:
+        elif is_complete_mpp and payment_hash in wallet.lnworker.dont_settle_htlcs:
             result["status"] = "paid"
             payment_key: str = wallet.lnworker._get_payment_key(bfh(payment_hash)).hex()
             htlc_status = wallet.lnworker.received_mpp_htlcs[payment_key]
@@ -1507,9 +1516,21 @@ class Commands(Logger):
             plist = wallet.lnworker.get_payments(status='settled')[bfh(payment_hash)]
             _dir, amount_msat, _fee, _ts = wallet.lnworker.get_payment_value(info, plist)
             result["received_amount_sat"] = amount_msat // 1000
+            result['preimage'] = wallet.lnworker.get_preimage_hex(payment_hash)
         if info is not None:
             result["invoice_amount_sat"] = (info.amount_msat or 0) // 1000
         return result
+
+    @command('wl')
+    async def export_lightning_preimage(self, payment_hash: str, wallet: 'Abstract_Wallet' = None) -> Optional[str]:
+        """
+        Returns the stored preimage of the given payment_hash if it is known.
+
+        arg:str:payment_hash: Hash of the preimage
+        """
+        preimage = wallet.lnworker.get_preimage_hex(payment_hash)
+        assert preimage is None or crypto.sha256(bytes.fromhex(preimage)).hex() == payment_hash
+        return preimage
 
     @command('w')
     async def addtransaction(self, tx, wallet: Abstract_Wallet = None):
@@ -1603,6 +1624,8 @@ class Commands(Logger):
     async def test_inject_fee_etas(self, fee_est):
         """
         Inject fee estimates into the network object, as if they were coming from connected servers.
+        `setconfig 'test_disable_automatic_fee_eta_update' true` to prevent Network from overriding
+        the configured fees.
         Useful on regtest.
 
         arg:str:fee_est:dict of ETA-based fee estimates, encoded as str
@@ -1627,7 +1650,7 @@ class Commands(Logger):
 
         arg:txid:txid:Transaction ID
         """
-        height = wallet.adb.get_tx_height(txid).height
+        height = wallet.adb.get_tx_height(txid).height()
         if height != TX_HEIGHT_LOCAL:
             raise UserFacingException(
                 f'Only local transactions can be removed. '
@@ -1665,7 +1688,12 @@ class Commands(Logger):
         arg:int:timeout:Timeout in seconds (default=20)
         """
         lnworker = self.network.lngossip if gossip else wallet.lnworker
-        await lnworker.add_peer(connection_string)
+        peer = await lnworker.add_peer(connection_string)
+        try:
+            await util.wait_for2(peer.initialized, timeout=LN_P2P_NETWORK_TIMEOUT)
+        except (CancelledError, Exception) as e:
+            #  FIXME often simply CancelledError and real cause (e.g. timeout) remains hidden
+            raise UserFacingException(f"Connection failed: {repr(e)}")
         return True
 
     @command('wnl')
@@ -1966,6 +1994,32 @@ class Commands(Logger):
             'log': [x.formatted_tuple() for x in log]
         }
 
+    @command('wnl')
+    async def get_submarine_swap_providers(self, query_time=15, wallet: Abstract_Wallet = None):
+        """
+        Queries nostr relays for available submarine swap providers.
+
+        To configure one of the providers use:
+        setconfig swapserver_npub 'npub...'
+
+        arg:int:query_time:Optional timeout how long the relays should be queried for provider announcements. Default: 15 sec
+        """
+        sm = wallet.lnworker.swap_manager
+        async with sm.create_transport() as transport:
+            assert isinstance(transport, NostrTransport)
+            await asyncio.sleep(query_time)
+            offers = transport.get_recent_offers()
+        result = {}
+        for offer in offers:
+            result[offer.server_npub] = {
+                "percentage_fee": offer.pairs.percentage,
+                "max_forward_sat": offer.pairs.max_forward,
+                "max_reverse_sat": offer.pairs.max_reverse,
+                "min_amount_sat": offer.pairs.min_amount,
+                "prepayment": 2 * offer.pairs.mining_fee,
+            }
+        return result
+
     @command('wnpl')
     async def normal_swap(self, onchain_amount, lightning_amount, password=None, wallet: Abstract_Wallet = None):
         """
@@ -1975,8 +2029,13 @@ class Commands(Logger):
         arg:decimal_or_dryrun:onchain_amount:Amount to be sent, in BTC. Set it to 'dryrun' to receive a value
         """
         sm = wallet.lnworker.swap_manager
-        with sm.create_transport() as transport:
-            await sm.is_initialized.wait()
+        assert self.config.SWAPSERVER_NPUB or self.config.SWAPSERVER_URL, \
+            "Configure swap provider first. See 'get_submarine_swap_providers'."
+        async with sm.create_transport() as transport:
+            try:
+                await asyncio.wait_for(sm.is_initialized.wait(), timeout=15)
+            except asyncio.TimeoutError:
+                raise TimeoutError("Could not find configured swap provider. Setup another one. See 'get_submarine_swap_providers'")
             if lightning_amount == 'dryrun':
                 onchain_amount_sat = satoshis(onchain_amount)
                 lightning_amount_sat = sm.get_recv_amount(onchain_amount_sat, is_reverse=False)
@@ -2002,37 +2061,53 @@ class Commands(Logger):
         }
 
     @command('wnpl')
-    async def reverse_swap(self, lightning_amount, onchain_amount, password=None, wallet: Abstract_Wallet = None):
+    async def reverse_swap(
+        self, lightning_amount, onchain_amount, prepayment='dryrun', password=None, wallet: Abstract_Wallet = None,
+    ):
         """
         Reverse submarine swap: send on Lightning, receive on-chain
 
         arg:decimal_or_dryrun:lightning_amount:Amount to be sent, in BTC. Set it to 'dryrun' to receive a value
         arg:decimal_or_dryrun:onchain_amount:Amount to be received, in BTC. Set it to 'dryrun' to receive a value
+        arg:decimal_or_dryrun:prepayment:Lightning payment required by the swap provider in order to cover their mining fees. This is included in lightning_amount. However, this part of the operation is not trustless; the provider is trusted to fail this payment if the swap fails.
         """
         sm = wallet.lnworker.swap_manager
-        with sm.create_transport() as transport:
-            await sm.is_initialized.wait()
+        assert self.config.SWAPSERVER_NPUB or self.config.SWAPSERVER_URL, \
+            "Configure swap provider first. See 'get_submarine_swap_providers'."
+        async with sm.create_transport() as transport:
+            try:
+                await asyncio.wait_for(sm.is_initialized.wait(), timeout=15)
+            except asyncio.TimeoutError:
+                raise TimeoutError("Could not find configured swap provider. Setup another one. See 'get_submarine_swap_providers'")
             if onchain_amount == 'dryrun':
                 lightning_amount_sat = satoshis(lightning_amount)
                 onchain_amount_sat = sm.get_recv_amount(lightning_amount_sat, is_reverse=True)
+                assert prepayment == "dryrun", f"Cannot use {prepayment=} in dryrun. Set it to 'dryrun'."
+                prepayment_sat = 2 * sm.mining_fee
                 funding_txid = None
             elif lightning_amount == 'dryrun':
                 onchain_amount_sat = satoshis(onchain_amount)
                 lightning_amount_sat = sm.get_send_amount(onchain_amount_sat, is_reverse=True)
+                assert prepayment == "dryrun", f"Cannot use {prepayment=} in dryrun. Set it to 'dryrun'."
+                prepayment_sat = 2 * sm.mining_fee
                 funding_txid = None
             else:
                 lightning_amount_sat = satoshis(lightning_amount)
                 claim_fee = sm.get_fee_for_txbatcher()
                 onchain_amount_sat = satoshis(onchain_amount) + claim_fee
+                assert prepayment != "dryrun", "Provide the 'prepayment' obtained from the dryrun."
+                prepayment_sat = satoshis(prepayment)
                 funding_txid = await wallet.lnworker.swap_manager.reverse_swap(
                     transport=transport,
                     lightning_amount_sat=lightning_amount_sat,
                     expected_onchain_amount_sat=onchain_amount_sat,
+                    prepayment_sat=prepayment_sat,
                 )
         return {
             'funding_txid': funding_txid,
             'lightning_amount': format_satoshis(lightning_amount_sat),
             'onchain_amount': format_satoshis(onchain_amount_sat),
+            'prepayment': format_satoshis(prepayment_sat)
         }
 
     @command('n')
@@ -2144,19 +2219,23 @@ class Commands(Logger):
 def plugin_command(s, plugin_name):
     """Decorator to register a cli command inside a plugin. To be used within a commands.py file
     in the plugins root."""
+    # atm all plugin commands require a daemon, cannot be run in 'offline' mode:
+    if 'n' not in s:
+        s += 'n'
     def decorator(func):
         assert len(plugin_name) > 0, "Plugin name must not be empty"
         func.plugin_name = plugin_name
         name = plugin_name + '_' + func.__name__
         if name in known_commands or hasattr(Commands, name):
             raise Exception(f"Command name {name} already exists. Plugin commands should not overwrite other commands.")
-        assert asyncio.iscoroutinefunction(func), f"Plugin commands must be a coroutine: {name}"
+        assert inspect.iscoroutinefunction(func), f"Plugin commands must be a coroutine: {name}"
 
         @command(s)
         @wraps(func)
         async def func_wrapper(*args, **kwargs):
             cmd_runner = args[0]  # type: Commands
             daemon = cmd_runner.daemon
+            assert daemon is not None
             kwargs['plugin'] = daemon._plugins.get_plugin(plugin_name)
             return await func(*args, **kwargs)
 
@@ -2390,7 +2469,7 @@ def get_parser():
                 continue
             help = cmd.arg_descriptions.get(optname)
             if not help:
-                print(f'undocumented argument {cmdname}::{optname}')
+                print(f'undocumented argument {cmdname}::{optname}', file=sys.stderr)
             action = "store_true" if default is False else 'store'
             if action == 'store':
                 type_descriptor = cmd.arg_types.get(optname)
@@ -2405,11 +2484,11 @@ def get_parser():
                 continue
             help = cmd.arg_descriptions.get(param)
             if not help:
-                print(f'undocumented argument {cmdname}::{param}')
+                print(f'undocumented argument {cmdname}::{param}', file=sys.stderr)
             type_descriptor = cmd.arg_types.get(param)
             _type = arg_types.get(type_descriptor)
             if help is not None and _type is None:
-                print(f'unknown type \'{_type}\' for {cmdname}::{param}')
+                print(f'unknown type \'{_type}\' for {cmdname}::{param}', file=sys.stderr)
             p.add_argument(param, help=help, type=_type)
 
         cvh = config_variables.get(cmdname)

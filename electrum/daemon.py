@@ -214,9 +214,9 @@ class AuthenticatedServer(Logger):
         self.auth_lock = asyncio.Lock()
         self._methods = {}  # type: Dict[str, Callable]
 
-    def register_method(self, f):
-        assert f.__name__ not in self._methods, f"name collision for {f.__name__}"
-        self._methods[f.__name__] = f
+    def register_method(self, name: str, f):
+        assert name not in self._methods, f"name collision for {name}"
+        self._methods[name] = f
 
     async def authenticate(self, headers):
         if self.rpc_password == '':
@@ -299,12 +299,12 @@ class CommandsServer(AuthenticatedServer):
         self.port = self.config.RPC_PORT
         self.app = web.Application()
         self.app.router.add_post("/", self.handle)
-        self.register_method(self.ping)
-        self.register_method(self.gui)
+        self.register_method('ping', self.ping)
+        self.register_method('gui', self.gui)
         self.cmd_runner = Commands(config=self.config, network=self.daemon.network, daemon=self.daemon)
         for cmdname in known_commands:
-            self.register_method(getattr(self.cmd_runner, cmdname))
-        self.register_method(self.run_cmdline)
+            self.register_method(cmdname, getattr(self.cmd_runner, cmdname))
+        self.register_method('run_cmdline', self.run_cmdline)
 
     def _socket_config_str(self) -> str:
         if self.socktype == 'unix':
@@ -462,7 +462,11 @@ class Daemon(Logger):
         #   note: the path returned by realpath has been observed NOT to work for FS operations!
         #         (e.g. for Cryptomator WinFSP/FUSE mounts, see #8495).
         #         It is okay for us to use it for computing a canonical wallet *key*, but cannot be used as a path!
-        path = os.path.realpath(path)
+        try:
+            path = os.path.realpath(path, strict=False)
+        except OSError as e:  # see #10182
+            _logger.warning(f"could not parse {path!r}: {e!r}")
+            path = path
         # - "normcase" does Windows-specific case and slash normalisation:
         path = os.path.normcase(path)
         # - prepend header to break usage of wallet keys as fs paths
@@ -476,14 +480,28 @@ class Daemon(Logger):
         return func_wrapper
 
     @with_wallet_lock
-    def load_wallet(self, path, password, *, upgrade=False) -> Optional[Abstract_Wallet]:
+    def load_wallet(
+        self,
+        path,
+        password: Optional[str],
+        *,
+        upgrade: bool = False,
+        force_check_password: bool = False,
+    ) -> Optional[Abstract_Wallet]:
+        """
+        force_check_password: if False, the password arg is only used if it needed to decrypt the storage.
+                              if True, the password arg is always validated.
+        """
         assert password != ''
         path = standardize_path(path)
         wallet_key = self._wallet_key_from_path(path)
         # wizard will be launched if we return
         if wallet := self._wallets.get(wallet_key):
+            if force_check_password:
+                wallet.check_password(password)
             return wallet
-        wallet = self._load_wallet(path, password, upgrade=upgrade, config=self.config)
+        wallet = self._load_wallet(
+            path, password, upgrade=upgrade, config=self.config, force_check_password=force_check_password)
         if self.network:
             wallet.start_network(self.network)
         elif wallet.lnworker:
@@ -501,10 +519,11 @@ class Daemon(Logger):
     @profiler
     def _load_wallet(
             path,
-            password,
+            password: Optional[str],
             *,
             upgrade: bool = False,
             config: SimpleConfig,
+            force_check_password: bool = False,  # if set, always validate password
     ) -> Optional[Abstract_Wallet]:
         path = standardize_path(path)
         storage = WalletStorage(path, allow_partial_writes=config.WALLET_PARTIAL_WRITES)
@@ -519,6 +538,8 @@ class Daemon(Logger):
         if db.get_action():
             raise WalletUnfinished(db)
         wallet = Wallet(db, config=config)
+        if force_check_password:
+            wallet.check_password(password)
         return wallet
 
     @with_wallet_lock
@@ -546,7 +567,7 @@ class Daemon(Logger):
 
     def stop_wallet(self, path: str) -> bool:
         """Returns True iff a wallet was found."""
-        # note: this must not be called from the event loop. # TODO raise if so
+        assert util.get_running_loop() != util.get_asyncio_loop(), 'must not be called from asyncio thread'
         fut = asyncio.run_coroutine_threadsafe(self._stop_wallet(path), self.asyncio_loop)
         return fut.result()
 
@@ -655,7 +676,7 @@ class Daemon(Logger):
             if not os.path.isfile(path):
                 continue
             wallet = self.get_wallet(path)
-            # note: we only create a new wallet object if one was not loaded into the wallet already.
+            # note: we only create a new wallet object if one was not loaded into the daemon already.
             #       This is to avoid having two wallet objects contending for the same file.
             #       Take care: this only works if the daemon knows about all wallet objects.
             #                  if other code already has created a Wallet() for a file but did not tell the daemon,

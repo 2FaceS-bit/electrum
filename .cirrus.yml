@@ -1,14 +1,13 @@
+# unittests using the 'latest' runtime python-dependencies
 task:
   container:
     image: $ELECTRUM_IMAGE
     cpu: 1
     memory: 2G
   matrix:
-    - name: "unittests: Tox Python $ELECTRUM_PYTHON_VERSION"
+    - name: "unittests: py$ELECTRUM_PYTHON_VERSION"
       env:
         ELECTRUM_IMAGE: python:$ELECTRUM_PYTHON_VERSION
-        TOXENV: py3
-        ELECTRUM_PYTHON_NAME: python3
       matrix:
        - env:
            ELECTRUM_PYTHON_VERSION: 3.10
@@ -18,39 +17,47 @@ task:
            ELECTRUM_PYTHON_VERSION: 3.12
        - env:
            ELECTRUM_PYTHON_VERSION: 3.13
-       - name: "unittests: Tox Python 3 debug mode"
+       - env:
+           ELECTRUM_PYTHON_VERSION: 3.14
+       - name: "unittests: py3.14, debug-mode"
          env:
-           ELECTRUM_PYTHON_VERSION: 3.13
+           ELECTRUM_PYTHON_VERSION: 3.14
            # enable additional checks:
            PYTHONASYNCIODEBUG: "1"
            PYTHONDEVMODE: "1"
   pip_cache:
     folder: ~/.cache/pip
     fingerprint_script: echo $ELECTRUM_IMAGE && cat $ELECTRUM_REQUIREMENTS_CI && cat $ELECTRUM_REQUIREMENTS
-  version_script:
-    - $ELECTRUM_PYTHON_NAME --version
   tag_script:
     - git tag
+  libsecp_build_cache:
+    folder: contrib/_saved_secp256k1_build
+    fingerprint_script: sha256sum ./contrib/make_libsecp256k1.sh
+    populate_script:
+      - apt-get update
+      - apt-get -y install automake libtool
+      - ./contrib/make_libsecp256k1.sh
+      - mkdir contrib/_saved_secp256k1_build
+      - cp electrum/libsecp256k1.so.* contrib/_saved_secp256k1_build/
   install_script:
     - apt-get update
     # qml test reqs:
     - apt-get -y install libgl1 libegl1 libxkbcommon0 libdbus-1-3
     - pip install -r $ELECTRUM_REQUIREMENTS_CI
-  libsecp_build_cache:
-    folder: contrib/_saved_secp256k1_build
-    fingerprint_script: sha256sum ./contrib/make_libsecp256k1.sh
-    populate_script:
-      - apt-get -y install automake libtool
-      - ./contrib/make_libsecp256k1.sh
-      - mkdir contrib/_saved_secp256k1_build
-      - cp electrum/libsecp256k1.so.* contrib/_saved_secp256k1_build/
-  tox_script:
-    - export PYTHONASYNCIODEBUG
-    - export PYTHONDEVMODE
+    # electrum itself:
     - export ELECTRUM_ECC_DONT_COMPILE=1
-    - tox
+    - pip install ".[tests,qml_gui]"
+  version_script:
+    - python3 --version
+    - pip freeze --all
+  pytest_script:
+    - >
+      coverage run --source=electrum \
+               "--omit=electrum/gui/*,electrum/plugins/*,electrum/scripts/*" \
+               -m pytest tests -v
+    - coverage report
   coveralls_script:
-    - if [ ! -z "$COVERALLS_REPO_TOKEN" ] ; then coveralls ; fi
+    - if [ ! -z "$COVERALLS_REPO_TOKEN" ] && [ "$ELECTRUM_PYTHON_VERSION" = "3.10" ] ; then coveralls ; fi
   env:
     LD_LIBRARY_PATH: contrib/_saved_secp256k1_build/
     ELECTRUM_REQUIREMENTS_CI: contrib/requirements/requirements-ci.txt
@@ -63,6 +70,49 @@ task:
     CI_BRANCH: $CIRRUS_BRANCH
     CI_PULL_REQUEST: $CIRRUS_PR
     # in addition, COVERALLS_REPO_TOKEN is set as an "override" in https://cirrus-ci.com/settings/...
+  depends_on:
+    - "linter: Flake8 Mandatory"
+
+# unittests using the ~same frozen dependencies that are used in the released binaries
+# note: not using pinned pyqt here, due to "qml_gui" extra
+task:
+  container:
+    image: $ELECTRUM_IMAGE
+    cpu: 1
+    memory: 2G
+  name: "unittests: py3.10, frozen-deps"
+  pip_cache:
+    folder: ~/.cache/pip
+    fingerprint_script: echo $ELECTRUM_IMAGE && cat contrib/requirements/requirements*.txt && cat contrib/deterministic-build/requirements*.txt
+  tag_script:
+    - git tag
+  libsecp_build_cache:
+    folder: contrib/_saved_secp256k1_build
+    fingerprint_script: sha256sum ./contrib/make_libsecp256k1.sh
+    populate_script:
+      - apt-get update
+      - apt-get -y install automake libtool
+      - ./contrib/make_libsecp256k1.sh
+      - mkdir contrib/_saved_secp256k1_build
+      - cp electrum/libsecp256k1.so.* contrib/_saved_secp256k1_build/
+  install_script:
+    - apt-get update
+    # qml test reqs:
+    - apt-get -y install libgl1 libegl1 libxkbcommon0 libdbus-1-3
+    - pip install -r contrib/deterministic-build/requirements-build-base.txt
+    - pip install -r contrib/requirements/requirements-ci.txt
+    # electrum itself:
+    - export ELECTRUM_ECC_DONT_COMPILE=1
+    - pip install -r contrib/deterministic-build/requirements.txt -r contrib/deterministic-build/requirements-binaries.txt
+    - pip install ".[tests,qml_gui]"
+  version_script:
+    - python3 --version
+    - pip freeze --all
+  pytest_script:
+    - pytest tests -v
+  env:
+    ELECTRUM_IMAGE: python:3.10
+    LD_LIBRARY_PATH: contrib/_saved_secp256k1_build/
   depends_on:
     - "linter: Flake8 Mandatory"
 
@@ -89,7 +139,7 @@ task:
     ELECTRUM_REQUIREMENTS_CI: contrib/requirements/requirements-ci.txt
     # in addition, crowdin_api_key is set as an "override" in https://cirrus-ci.com/settings/...
   depends_on:
-    - "unittests: Tox Python 3.10"
+    - "unittests: py3.10"
   only_if: $CIRRUS_BRANCH == 'master'
 
 task:
@@ -133,9 +183,16 @@ task:
     - tests/regtest/run_bitcoind.sh
   electrumx_service_background_script:
     - tests/regtest/run_electrumx.sh
+  # if any test fails, the test will get aborted (--failfast) and the wallet directories will be
+  # available for download in the Cirrus UI
   regtest_script:
     - sleep 10s
-    - python3 -m unittest tests/regtest.py
+    - python3 -m unittest tests/regtest.py --failfast || TEST_EXIT_CODE=$?
+    - tar -czf test_wallets.tar.gz /tmp/alice /tmp/bob /tmp/carol || true
+    - exit ${TEST_EXIT_CODE:-0}
+  on_failure:
+    wallet_artifacts:
+      path: "test_wallets.tar.gz"
   env:
     LD_LIBRARY_PATH: contrib/_saved_secp256k1_build/
     ELECTRUM_REQUIREMENTS: contrib/requirements/requirements.txt
@@ -154,7 +211,7 @@ task:
     folder: ~/.cache/pip
     fingerprint_script: echo Flake8 && echo $ELECTRUM_IMAGE && cat $ELECTRUM_REQUIREMENTS
   install_script:
-    - pip install "flake8==7.2.0" "flake8-bugbear==24.12.12"
+    - pip install "flake8==7.3.0" "flake8-bugbear==25.10.21"
   flake8_script:
     - flake8 . --count --select="$ELECTRUM_LINTERS" --ignore="$ELECTRUM_LINTERS_IGNORE" --show-source --statistics --exclude "*_pb2.py,electrum/_vendor/"
   env:
@@ -167,8 +224,8 @@ task:
         # - https://flake8.pycqa.org/en/latest/user/error-codes.html
         # - https://pycodestyle.pycqa.org/en/latest/intro.html#error-codes
         # - https://github.com/PyCQA/flake8-bugbear/tree/8c0e7eb04217494d48d0ab093bf5b31db0921989#list-of-warnings
-        ELECTRUM_LINTERS: E9,E101,E129,E273,E274,E703,E71,E722,F5,F6,F7,F8,W191,W29,B
-        ELECTRUM_LINTERS_IGNORE: B007,B009,B010,B019,B036,F541,F841
+        ELECTRUM_LINTERS: E9,E101,E129,E273,E274,E703,E71,E722,F5,F6,F7,F8,W191,W29,B,B909
+        ELECTRUM_LINTERS_IGNORE: B007,B009,B010,B036,B042,F541,F841
     - name: "linter: Flake8 Non-Mandatory"
       env:
         ELECTRUM_LINTERS: E,F,W,C90,B
@@ -222,7 +279,7 @@ task:
     CIRRUS_WORKING_DIR: /opt/wine64/drive_c/electrum
     CIRRUS_DOCKER_CONTEXT: contrib/build-wine
   depends_on:
-    - "unittests: Tox Python 3.10"
+    - "unittests: py3.10"
 
 task:
   name: "build: Android (QML $APK_ARCH)"
@@ -256,7 +313,7 @@ task:
   binaries_artifacts:
     path: "dist/*"
   depends_on:
-    - "unittests: Tox Python 3.10"
+    - "unittests: py3.10"
 
 ## mac build disabled, as Cirrus CI no longer supports Intel-based mac builds
 #task:
@@ -296,8 +353,10 @@ task:
       only_if: $CIRRUS_CRON == ""
     - trigger_type: automatic
       only_if: $CIRRUS_CRON == "nightly"
-  container:
-    dockerfile: contrib/build-linux/appimage/Dockerfile
+  compute_engine_instance:
+    image_project: cirrus-images
+    image: family/docker-builder
+    platform: linux
     cpu: 2
     memory: 2G
   pip_cache:
@@ -313,13 +372,11 @@ task:
       - cat contrib/make_libsecp256k1.sh | sha256sum
       - git ls-files -s contrib/build-linux/appimage/
   build_script:
-    - ./contrib/build-linux/appimage/make_appimage.sh
+    - ./contrib/build-linux/appimage/build.sh
   binaries_artifacts:
     path: "dist/*"
-  env:
-    CIRRUS_DOCKER_CONTEXT: contrib/build-linux/appimage
   depends_on:
-    - "unittests: Tox Python 3.10"
+    - "unittests: py3.10"
 
 task:
   container:
@@ -342,7 +399,7 @@ task:
       env:
         OMIT_UNCLEAN_FILES: 1
   depends_on:
-    - "unittests: Tox Python 3.10"
+    - "unittests: py3.10"
 
 task:
   name: "check submodules"

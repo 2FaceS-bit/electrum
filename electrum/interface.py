@@ -50,7 +50,7 @@ import certifi
 from .util import (ignore_exceptions, log_exceptions, bfh, ESocksProxy,
                    is_integer, is_non_negative_integer, is_hash256_str, is_hex_str,
                    is_int_or_float, is_non_negative_int_or_float, OldTaskGroup,
-                   send_exception_to_crash_reporter, error_text_str_to_safe_str)
+                   send_exception_to_crash_reporter, error_text_str_to_safe_str, versiontuple)
 from . import util
 from . import x509
 from . import pem
@@ -137,6 +137,18 @@ def assert_dict_contains_field(d: Any, *, field_name: str) -> Any:
 def assert_list_or_tuple(val: Any) -> None:
     if not isinstance(val, (list, tuple)):
         raise RequestCorrupted(f'{val!r} should be a list or tuple')
+
+
+def protocol_tuple(s: Any) -> tuple[int, ...]:
+    """Converts a protocol version number, such as "1.0" to a tuple (1, 0).
+
+    If the version number is bad, (0, ) indicating version 0 is returned.
+    """
+    try:
+        assert isinstance(s, str)
+        return versiontuple(s)
+    except Exception:
+        return (0, )
 
 
 class ChainResolutionMode(enum.Enum):
@@ -328,6 +340,9 @@ class PaddedRSTransport(RSTransport):
 
     MIN_PACKET_SIZE = 1024
     WAIT_FOR_BUFFER_GROWTH_SECONDS = 1.0
+    # (unpadded) amount of bytes sent instantly before beginning with polling.
+    # This makes the initial handshake where a few small messages are exchanged faster.
+    WARMUP_BUDGET_SIZE = 1024
 
     session: Optional['RPCSession']
 
@@ -361,6 +376,7 @@ class PaddedRSTransport(RSTransport):
             self._force_send
             or len(buf) >= self.MIN_PACKET_SIZE
             or self._last_send + self.WAIT_FOR_BUFFER_GROWTH_SECONDS < time.monotonic()
+            or self.session.send_size < self.WARMUP_BUDGET_SIZE
         ):
             return
         assert buf[-2:] in (b"}\n", b"]\n"), f"unexpected json-rpc terminator: {buf[-2:]=!r}"
@@ -423,6 +439,13 @@ class PaddedRSTransport(RSTransport):
             # This a short-lived "fetch_certificate"-type session.
             # No polling here, we always force-empty the buffer.
             self._force_send = True
+
+    async def close(self, *args, **kwargs):
+        '''Close the connection and return when closed.'''
+        # Flush buffer before disconnecting. This makes ReplyAndDisconnect work:
+        self._force_send = True
+        self._maybe_consume_sbuffer()
+        await super().close(*args, **kwargs)
 
 
 class ServerAddr:
@@ -562,6 +585,8 @@ class Interface(Logger):
         self._rawtx_cache = LRUCache(maxsize=20)  # type: LRUCache[str, bytes]  # txid->rawtx
 
         self.fee_estimates_eta = {}  # type: Dict[int, int]
+
+        self.active_protocol_tuple = (0,)  # type: Optional[tuple[int, ...]]
 
         # Dump network messages (only for this interface).  Set at runtime from the console.
         self.debug = False
@@ -843,13 +868,25 @@ class Interface(Logger):
         res = await self.session.send_request('blockchain.block.headers', [start_height, count], timeout=timeout)
         # check response
         assert_dict_contains_field(res, field_name='count')
-        assert_dict_contains_field(res, field_name='hex')
         assert_dict_contains_field(res, field_name='max')
         assert_non_negative_integer(res['count'])
         assert_non_negative_integer(res['max'])
-        assert_hex_str(res['hex'])
-        if len(res['hex']) != HEADER_SIZE * 2 * res['count']:
-            raise RequestCorrupted('inconsistent chunk hex and count')
+        if self.active_protocol_tuple >= (1, 6):
+            hex_headers_list = assert_dict_contains_field(res, field_name='headers')
+            assert_list_or_tuple(hex_headers_list)
+            for item in hex_headers_list:
+                assert_hex_str(item)
+                if len(item) != HEADER_SIZE * 2:
+                    raise RequestCorrupted(f"invalid header size. got {len(item)//2}, expected {HEADER_SIZE}")
+            if len(hex_headers_list) != res['count']:
+                raise RequestCorrupted(f"{len(hex_headers_list)=} != {res['count']=}")
+            headers = list(bfh(hex_header) for hex_header in hex_headers_list)
+        else: # proto 1.4
+            hex_headers_concat = assert_dict_contains_field(res, field_name='hex')
+            assert_hex_str(hex_headers_concat)
+            if len(hex_headers_concat) != HEADER_SIZE * 2 * res['count']:
+                raise RequestCorrupted('inconsistent chunk hex and count')
+            headers = list(util.chunks(bfh(hex_headers_concat), size=HEADER_SIZE))
         # we never request more than MAX_NUM_HEADERS_IN_REQUEST headers, but we enforce those fit in a single response
         if res['max'] < MAX_NUM_HEADERS_PER_REQUEST:
             raise RequestCorrupted(f"server uses too low 'max' count for block.headers: {res['max']} < {MAX_NUM_HEADERS_PER_REQUEST}")
@@ -862,7 +899,6 @@ class Interface(Logger):
                 raise RequestCorrupted(
                     f"asked for {count} headers but got fewer: {res['count']}. ({start_height=}, {self.tip=})")
         # checks done.
-        headers = list(util.chunks(bfh(res['hex']), size=HEADER_SIZE))
         return headers
 
     async def request_chunk_below_max_checkpoint(
@@ -950,21 +986,34 @@ class Interface(Logger):
             proxy=self.proxy,
             transport=PaddedRSTransport,
         ) as session:
+            start = time.perf_counter()
             self.session = session  # type: NotificationSession
             self.session.set_default_timeout(self.network.get_network_timeout_seconds(NetworkTimeout.Generic))
+            client_prange = [version.PROTOCOL_VERSION_MIN, version.PROTOCOL_VERSION_MAX]
             try:
-                ver = await session.send_request('server.version', [self.client_name(), version.PROTOCOL_VERSION])
+                ver = await session.send_request('server.version', [self.client_name(), client_prange])
             except aiorpcx.jsonrpc.RPCError as e:
                 raise GracefulDisconnect(e)  # probably 'unsupported protocol version'
             if exit_early:
                 return
-            if ver[1] != version.PROTOCOL_VERSION:
+            self.active_protocol_tuple = protocol_tuple(ver[1])
+            client_pmin = protocol_tuple(client_prange[0])
+            client_pmax = protocol_tuple(client_prange[1])
+            if not (client_pmin <= self.active_protocol_tuple <= client_pmax):
                 raise GracefulDisconnect(f'server violated protocol-version-negotiation. '
-                                         f'we asked for {version.PROTOCOL_VERSION!r}, they sent {ver[1]!r}')
+                                         f'we asked for {client_prange!r}, they sent {ver[1]!r}')
             if not self.network.check_interface_against_healthy_spread_of_connected_servers(self):
                 raise GracefulDisconnect(f'too many connected servers already '
                                          f'in bucket {self.bucket_based_on_ipaddress()}')
-            self.logger.info(f"connection established. version: {ver}")
+
+            try:
+                features = await session.send_request('server.features')
+                server_genesis_hash = assert_dict_contains_field(features, field_name='genesis_hash')
+            except (aiorpcx.jsonrpc.RPCError, RequestCorrupted) as e:
+                raise GracefulDisconnect(e)
+            if server_genesis_hash != constants.net.GENESIS:
+                raise GracefulDisconnect(f'server on different chain: {server_genesis_hash=}. ours: {constants.net.GENESIS}')
+            self.logger.info(f"connection established. version: {ver}, handshake duration: {(time.perf_counter() - start) * 1000:.2f} ms")
 
             try:
                 async with self.taskgroup as group:
@@ -1367,6 +1416,33 @@ class Interface(Logger):
         # the status of a scripthash we are subscribed to. Caching here will save a future get_transaction RPC.
         self._rawtx_cache[txid_calc] = bytes.fromhex(rawtx)
 
+    async def broadcast_txpackage(self, txs: Sequence['Transaction']) -> bool:
+        assert self.active_protocol_tuple >= (1, 6), f"server using old protocol: {self.active_protocol_tuple}"
+        rawtxs = [tx.serialize() for tx in txs]
+        assert all(is_hex_str(rawtx) for rawtx in rawtxs)
+        assert all(tx.txid() is not None for tx in txs)
+        timeout = self.network.get_network_timeout_seconds(NetworkTimeout.Urgent)
+        for tx in txs:
+            if any(DummyAddress.is_dummy_address(txout.address) for txout in tx.outputs()):
+                raise DummyAddressUsedInTxException("tried to broadcast tx with dummy address!")
+        try:
+            res = await self.session.send_request('blockchain.transaction.broadcast_package', [rawtxs], timeout=timeout)
+        except aiorpcx.jsonrpc.CodeMessageError as e:
+            self.logger.info(f"broadcast_txpackage error [DO NOT TRUST THIS MESSAGE]: {error_text_str_to_safe_str(repr(e))}. {rawtxs=}")
+            return False
+        success = assert_dict_contains_field(res, field_name='success')
+        if not success:
+            errors = assert_dict_contains_field(res, field_name='errors')
+            self.logger.info(f"broadcast_txpackage error [DO NOT TRUST THIS MESSAGE]: {error_text_str_to_safe_str(repr(errors))}. {rawtxs=}")
+            return False
+        assert success
+        # broadcast succeeded.
+        # We now cache the rawtx, for *this interface only*. The tx likely touches some ismine addresses, affecting
+        # the status of a scripthash we are subscribed to. Caching here will save a future get_transaction RPC.
+        for tx, rawtx in zip(txs, rawtxs):
+            self._rawtx_cache[tx.txid()] = bytes.fromhex(rawtx)
+        return True
+
     async def get_history_for_scripthash(self, sh: str) -> List[dict]:
         if not is_hash256_str(sh):
             raise Exception(f"{repr(sh)} is not a scripthash")
@@ -1379,6 +1455,8 @@ class Interface(Logger):
             height = assert_dict_contains_field(tx_item, field_name='height')
             assert_dict_contains_field(tx_item, field_name='tx_hash')
             assert_integer(height)
+            if height < -1:
+                raise RequestCorrupted(f'{height!r} is not a valid block height')
             assert_hash256_str(tx_item['tx_hash'])
             if height in (-1, 0):
                 assert_dict_contains_field(tx_item, field_name='fee')
@@ -1389,6 +1467,11 @@ class Interface(Logger):
                 if height < prev_height:
                     raise RequestCorrupted(f'heights of confirmed txs must be in increasing order')
                 prev_height = height
+        if self.active_protocol_tuple >= (1, 6):
+            # enforce order of mempool txs
+            mempool_txs = [tx_item for tx_item in res if tx_item['height'] <= 0]
+            if mempool_txs != sorted(mempool_txs, key=lambda x: (-x['height'], bytes.fromhex(x['tx_hash']))):
+                raise RequestCorrupted(f'mempool txs not in canonical order')
         hashes = set(map(lambda item: item['tx_hash'], res))
         if len(hashes) != len(res):
             # Either server is sending garbage... or maybe if server is race-prone
@@ -1487,10 +1570,14 @@ class Interface(Logger):
     async def get_relay_fee(self) -> int:
         """Returns the min relay feerate in sat/kbyte."""
         # do request
-        res = await self.session.send_request('blockchain.relayfee')
+        if self.active_protocol_tuple >= (1, 6):
+            res = await self.session.send_request('mempool.get_info')
+            minrelaytxfee = assert_dict_contains_field(res, field_name='minrelaytxfee')
+        else:
+            minrelaytxfee = await self.session.send_request('blockchain.relayfee')
         # check response
-        assert_non_negative_int_or_float(res)
-        relayfee = int(res * bitcoin.COIN)
+        assert_non_negative_int_or_float(minrelaytxfee)
+        relayfee = int(minrelaytxfee * bitcoin.COIN)
         relayfee = max(0, relayfee)
         return relayfee
 

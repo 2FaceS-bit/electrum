@@ -775,6 +775,7 @@ Warning: setting this to too low will result in lots of payment failures."""),
     FEE_POLICY = ConfigVar('fee_policy.default', default='eta:2', type_=str)  # exposed to GUI
     FEE_POLICY_LIGHTNING = ConfigVar('fee_policy.lnwatcher', default='eta:2', type_=str)  # for txbatcher (sweeping)
     FEE_POLICY_SWAPS = ConfigVar('fee_policy.swaps', default='eta:2', type_=str)  # for txbatcher (sweeping and sending if we are a swapserver)
+    TEST_DISABLE_AUTOMATIC_FEE_ETA_UPDATE = ConfigVar('test_disable_automatic_fee_eta_update', default=False, type_=bool)
 
     RPC_USERNAME = ConfigVar('rpcuser', default=None, type_=str)
     RPC_PASSWORD = ConfigVar('rpcpassword', default=None, type_=str)
@@ -892,7 +893,18 @@ Warning: setting this to too low will result in lots of payment failures."""),
         short_desc=lambda: _("Write logs to file"),
         long_desc=lambda: _('Debug logs can be persisted to disk. These are useful for troubleshooting.'),
     )
-    LOGS_NUM_FILES_KEEP = ConfigVar('logs_num_files_keep', default=30, type_=int)
+    LOGS_NUM_FILES_KEEP = ConfigVar(
+        'logs_num_files_keep', default=30, type_=int,
+        long_desc=lambda: _("Old log files get deleted on startup, with only the newest few being kept."),
+    )
+    LOGS_MAX_TOTAL_SIZE_BYTES = ConfigVar(
+        'logs_max_total_size', default=200_000_000, type_=int,
+        long_desc=lambda: _(
+            "Old log files get deleted on startup. "
+            "This value limits the max total size of the old log files kept, "
+            "and also separately the max size of the current log file. "
+            "Hence, the max disk usage will be twice this value."),
+    )
     GUI_ENABLE_DEBUG_LOGS = ConfigVar('gui_enable_debug_logs', default=False, type_=bool)
     LOCALIZATION_LANGUAGE = ConfigVar(
         'language', default="", type_=str,

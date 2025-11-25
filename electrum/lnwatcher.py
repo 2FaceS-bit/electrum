@@ -2,7 +2,7 @@
 # Distributed under the MIT software license, see the accompanying
 # file LICENCE or http://www.opensource.org/licenses/mit-license.php
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Dict, Callable, Awaitable
 
 from . import util
 from .util import TxMinedInfo, BelowDustLimit, NoDynamicFeeEstimates
@@ -27,11 +27,9 @@ class LNWatcher(Logger, EventListener):
         Logger.__init__(self)
         self.adb = lnworker.wallet.adb
         self.config = lnworker.config
-        self.callbacks = {}  # address -> lambda function
+        self.callbacks = {}  # type: Dict[str, Callable[[], Awaitable[None]]]  # address -> lambda function
         self.network = None
         self.register_callbacks()
-        # status gets populated when we run
-        self.channel_status = {}
         self._pending_force_closes = set()
 
     def start_network(self, network: 'Network'):
@@ -40,23 +38,29 @@ class LNWatcher(Logger, EventListener):
     def stop(self):
         self.unregister_callbacks()
 
-    def get_channel_status(self, outpoint):
-        return self.channel_status.get(outpoint, 'unknown')
-
-    def remove_callback(self, address):
+    def remove_callback(self, address: str) -> None:
         self.callbacks.pop(address, None)
 
-    def add_callback(self, address, callback, *, subscribe=True):
+    def add_callback(
+        self,
+        address: str,
+        callback: Callable[[], Awaitable[None]],
+        *,
+        subscribe: bool = True,
+    ) -> None:
         if subscribe:
             self.adb.add_address(address)
         self.callbacks[address] = callback
 
-    async def trigger_callbacks(self, *, requires_synchronizer=True):
+    async def trigger_callbacks(self, *, requires_synchronizer: bool = True):
         if requires_synchronizer and not self.adb.synchronizer:
             self.logger.info("synchronizer not set yet")
             return
         for address, callback in list(self.callbacks.items()):
-            await callback()
+            try:
+                await callback()
+            except Exception:
+                self.logger.exception(f"LNWatcher callback failed {address=}")
         # send callback to GUI
         util.trigger_callback('wallet_updated', self.lnworker.wallet)
 
@@ -153,6 +157,9 @@ class LNWatcher(Logger, EventListener):
         chan = self.lnworker.channel_by_txo(funding_outpoint)
         if not chan:
             return False
+        if not chan.need_to_subscribe():
+            return False
+        self.logger.info(f'sweep_commitment_transaction {funding_outpoint}')
         # detect who closed and get information about how to claim outputs
         is_local_ctx, sweep_info_dict = chan.get_ctx_sweep_info(closing_tx)
         # note: we need to keep watching *at least* until the closing tx is deeply mined,
@@ -203,10 +210,12 @@ class LNWatcher(Logger, EventListener):
         try:
             self.lnworker.wallet.txbatcher.add_sweep_input('lnwatcher', sweep_info)
         except BelowDustLimit:
+            self.logger.debug(f"maybe_redeem: BelowDustLimit: {sweep_info.name}")
             # utxo is considered dust at *current* fee estimates.
             # but maybe the fees atm are very high? We will retry later.
             pass
         except NoDynamicFeeEstimates:
+            self.logger.debug(f"maybe_redeem: NoDynamicFeeEstimates: {sweep_info.name}")
             pass  # will retry later
         if sweep_info.is_anchor():
             return False
@@ -272,5 +281,5 @@ class LNWatcher(Logger, EventListener):
                 # We should not keep warning the user forever.
                 return
             tx_mined_status = self.adb.get_tx_height(spender_txid)
-            if tx_mined_status.height == TX_HEIGHT_LOCAL:
+            if tx_mined_status.height() == TX_HEIGHT_LOCAL:
                 self._pending_force_closes.add(chan)

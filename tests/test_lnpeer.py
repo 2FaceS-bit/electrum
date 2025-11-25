@@ -10,7 +10,7 @@ import logging
 import concurrent
 from concurrent import futures
 from unittest import mock
-from typing import Iterable, NamedTuple, Tuple, List, Dict
+from typing import Iterable, NamedTuple, Tuple, List, Dict, Sequence
 
 from aiorpcx import timeout_after, TaskTimeout
 from electrum_ecc import ECPrivkey
@@ -41,7 +41,7 @@ from electrum.lnworker import PaymentInfo, RECEIVED
 from electrum.lnonion import OnionFailureCode, OnionRoutingFailure
 from electrum.lnutil import UpdateAddHtlc
 from electrum.lnutil import LOCAL, REMOTE
-from electrum.invoices import PR_PAID, PR_UNPAID, Invoice
+from electrum.invoices import PR_PAID, PR_UNPAID, Invoice, LN_EXPIRY_NEVER
 from electrum.interface import GracefulDisconnect
 from electrum.simple_config import SimpleConfig
 from electrum.fee_policy import FeeTimeEstimates, FEE_ETA_TARGETS
@@ -215,7 +215,8 @@ class MockLNWallet(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
         self.downstream_to_upstream_htlc = {}
         self.dont_settle_htlcs = {}
         self.hold_invoice_callbacks = {}
-        self.payment_bundles = [] # lists of hashes. todo:persist
+        self._payment_bundles_pkey_to_canon = {}       # type: Dict[bytes, bytes]
+        self._payment_bundles_canon_to_pkeylist = {}   # type: Dict[bytes, Sequence[bytes]]
         self.config.INITIAL_TRAMPOLINE_FEE_LEVEL = 0
 
         self.logger.info(f"created LNWallet[{name}] with nodeID={local_keypair.pubkey.hex()}")
@@ -346,6 +347,11 @@ class MockLNWallet(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
     current_target_feerate_per_kw = LNWallet.current_target_feerate_per_kw
     current_low_feerate_per_kw_srk_channel = LNWallet.current_low_feerate_per_kw_srk_channel
     maybe_cleanup_mpp = LNWallet.maybe_cleanup_mpp
+    create_onion_for_route = LNWallet.create_onion_for_route
+    maybe_forward_htlc = LNWallet.maybe_forward_htlc
+    maybe_forward_trampoline = LNWallet.maybe_forward_trampoline
+    _maybe_refuse_to_forward_htlc_that_corresponds_to_payreq_we_created = LNWallet._maybe_refuse_to_forward_htlc_that_corresponds_to_payreq_we_created
+    _process_htlc_log = LNWallet._process_htlc_log
 
 
 class MockTransport:
@@ -558,10 +564,8 @@ class TestPeer(ElectrumTestCase):
             payment_preimage = os.urandom(32)
         if payment_hash is None:
             payment_hash = sha256(payment_preimage)
-        info = PaymentInfo(payment_hash, amount_msat, RECEIVED, PR_UNPAID)
         if payment_preimage:
             w2.save_preimage(payment_hash, payment_preimage)
-        w2.save_payment_info(info)
         if include_routing_hints:
             routing_hints = w2.calc_routing_hints_for_invoice(amount_msat)
         else:
@@ -574,7 +578,16 @@ class TestPeer(ElectrumTestCase):
         else:
             payment_secret = None
         if min_final_cltv_delta is None:
-            min_final_cltv_delta = lnutil.MIN_FINAL_CLTV_DELTA_FOR_INVOICE
+            min_final_cltv_delta = lnutil.MIN_FINAL_CLTV_DELTA_ACCEPTED
+        info = PaymentInfo(
+            payment_hash=payment_hash,
+            amount_msat=amount_msat,
+            direction=RECEIVED,
+            status=PR_UNPAID,
+            min_final_cltv_delta=min_final_cltv_delta,
+            expiry_delay=LN_EXPIRY_NEVER,
+        )
+        w2.save_payment_info(info)
         lnaddr1 = LnAddr(
             paymenthash=payment_hash,
             amount=amount_btc,
@@ -1116,12 +1129,8 @@ class TestPeerDirect(TestPeer):
         util.register_callback(on_htlc_fulfilled, ["htlc_fulfilled"])
         util.register_callback(on_htlc_failed, ["htlc_failed"])
 
-        try:
-            with self.assertRaises(SuccessfulTest):
-                await f()
-        finally:
-            util.unregister_callback(on_htlc_fulfilled)
-            util.unregister_callback(on_htlc_failed)
+        with self.assertRaises(SuccessfulTest):
+            await f()
 
     async def test_payment_recv_mpp_confusion2(self):
         """Regression test for https://github.com/spesmilo/electrum/security/advisories/GHSA-8r85-vp7r-hjxf"""
@@ -1190,12 +1199,8 @@ class TestPeerDirect(TestPeer):
         util.register_callback(on_htlc_fulfilled, ["htlc_fulfilled"])
         util.register_callback(on_htlc_failed, ["htlc_failed"])
 
-        try:
-            with self.assertRaises(SuccessfulTest):
-                await f()
-        finally:
-            util.unregister_callback(on_htlc_fulfilled)
-            util.unregister_callback(on_htlc_failed)
+        with self.assertRaises(SuccessfulTest):
+            await f()
 
     async def test_legacy_shutdown_low(self):
         await self._test_shutdown(alice_fee=100, bob_fee=150)

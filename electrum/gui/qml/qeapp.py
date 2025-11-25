@@ -22,6 +22,7 @@ from electrum.base_crash_reporter import BaseCrashReporter, EarlyExceptionsQueue
 from electrum.network import Network
 from electrum.plugin import run_hook
 from electrum.gui.common_qt.util import get_font_id
+from electrum.util import profiler
 
 from .qeconfig import QEConfig
 from .qedaemon import QEDaemon
@@ -33,6 +34,7 @@ from .qebitcoin import QEBitcoin
 from .qefx import QEFX
 from .qetxfinalizer import QETxFinalizer, QETxRbfFeeBumper, QETxCpfpFeeBumper, QETxCanceller, QETxSweepFinalizer, FeeSlider
 from .qeinvoice import QEInvoice, QEInvoiceParser
+from .qepiresolver import QEPIResolver
 from .qerequestdetails import QERequestDetails
 from .qetypes import QEAmount, QEBytes
 from .qeaddressdetails import QEAddressDetails
@@ -60,6 +62,7 @@ if 'ANDROID_DATA' in os.environ:
     jString = autoclass('java.lang.String')
     jIntent = autoclass('android.content.Intent')
     jview = jpythonActivity.getWindow().getDecorView()
+    systemSdkVersion = autoclass('android.os.Build$VERSION').SDK_INT
 
 notification = None
 
@@ -414,6 +417,54 @@ class QEAppController(BaseCrashReporter, QObject):
             self._secureWindow = secure
             self.secureWindowChanged.emit()
 
+    @pyqtSlot(result=bool)
+    def enforcesEdgeToEdge(self) -> bool:
+        if not self.isAndroid():
+            return False
+        return bool(systemSdkVersion >= 35)
+
+    @profiler(min_threshold=0.02)
+    def _getSystemBarHeight(self, bar_type: str) -> int:
+        if not self.enforcesEdgeToEdge():
+            return 0
+        assert systemSdkVersion >= 30, \
+            f"Android WindowInsets unavailable on {systemSdkVersion=}"
+        try:
+            root_insets = jview.getRootWindowInsets()
+            window_insets_type = autoclass('android.view.WindowInsets$Type')
+
+            if bar_type == 'status':
+                ins = root_insets.getInsets(window_insets_type.statusBars())
+            elif bar_type == 'navigation':
+                ins = root_insets.getInsets(window_insets_type.navigationBars())
+            else:
+                raise ValueError(f"Invalid bar_type: {bar_type}")
+
+            # Get the display metrics to convert pixels to dp
+            display_metrics = jpythonActivity.getResources().getDisplayMetrics()
+            density = display_metrics.density
+
+            height = int(max(ins.bottom, ins.right, ins.left, ins.top, 0))
+            if not height > 0:
+                return 0
+
+            # Convert from pixels to dp for QML
+            height_dp = int(height / density)
+
+            self.logger.debug(f"_getSystemBarHeight: {height=}, {height_dp=}, {bar_type=}")
+            return max(0, height_dp)
+        except Exception as e:
+            self.logger.debug(f"{bar_type} fallback due to: {e!r}")
+            return 0
+
+    @pyqtSlot(result=int)
+    def getStatusBarHeight(self) -> int:
+        return self._getSystemBarHeight('status')
+
+    @pyqtSlot(result=int)
+    def getNavigationBarHeight(self) -> int:
+        return self._getSystemBarHeight('navigation')
+
 
 class ElectrumQmlApplication(QGuiApplication):
 
@@ -439,6 +490,7 @@ class ElectrumQmlApplication(QGuiApplication):
         qmlRegisterType(QEQRScanner, 'org.electrum', 1, 0, 'QRScanner')
         qmlRegisterType(QEFX, 'org.electrum', 1, 0, 'FX')
         qmlRegisterType(QETxFinalizer, 'org.electrum', 1, 0, 'TxFinalizer')
+        qmlRegisterType(QEPIResolver, 'org.electrum', 1, 0, 'PIResolver')
         qmlRegisterType(QEInvoice, 'org.electrum', 1, 0, 'Invoice')
         qmlRegisterType(QEInvoiceParser, 'org.electrum', 1, 0, 'InvoiceParser')
         qmlRegisterType(QEAddressDetails, 'org.electrum', 1, 0, 'AddressDetails')
@@ -494,7 +546,7 @@ class ElectrumQmlApplication(QGuiApplication):
         self.context.setContextProperty('QRIP', self.qr_ip_h)
         self.context.setContextProperty('BUILD', {
             'electrum_version': version.ELECTRUM_VERSION,
-            'protocol_version': version.PROTOCOL_VERSION,
+            'protocol_version': f"[{version.PROTOCOL_VERSION_MIN}, {version.PROTOCOL_VERSION_MAX}]",
             'qt_version': QT_VERSION_STR,
             'pyqt_version': PYQT_VERSION_STR
         })

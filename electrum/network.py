@@ -43,7 +43,7 @@ from aiohttp import ClientResponse
 
 from . import util
 from .util import (
-    log_exceptions, ignore_exceptions, OldTaskGroup, make_aiohttp_session, MyEncoder,
+    log_exceptions, ignore_exceptions, OldTaskGroup, make_aiohttp_session,
     NetworkRetryManager, error_text_str_to_safe_str, detect_tor_socks_proxy
 )
 from . import constants
@@ -55,7 +55,7 @@ from .interface import (
     Interface, PREFERRED_NETWORK_PROTOCOL, RequestTimedOut, NetworkTimeout, BUCKET_NAME_OF_ONION_SERVERS,
     NetworkException, RequestCorrupted, ServerAddr, TxBroadcastError,
 )
-from .version import PROTOCOL_VERSION
+from .version import PROTOCOL_VERSION_MIN
 from .i18n import _
 from .logging import get_logger, Logger
 from .fee_policy import FeeHistogram, FeeTimeEstimates, FEE_ETA_TARGETS
@@ -118,7 +118,7 @@ def parse_servers(result: Sequence[Tuple[str, str, List[str]]]) -> Dict[str, dic
 def filter_version(servers):
     def is_recent(version):
         try:
-            return util.versiontuple(version) >= util.versiontuple(PROTOCOL_VERSION)
+            return util.versiontuple(version) >= util.versiontuple(PROTOCOL_VERSION_MIN)
         except Exception as e:
             return False
     return {k: v for k, v in servers.items() if is_recent(v.get('version'))}
@@ -471,7 +471,7 @@ class Network(Logger, NetworkRetryManager[ServerAddr]):
         if not self.config.path:
             return
         path = os.path.join(self.config.path, "recent_servers")
-        s = json.dumps(self._recent_servers, indent=4, sort_keys=True, cls=MyEncoder)
+        s = json.dumps(self._recent_servers, indent=4, sort_keys=True, default=str)
         try:
             with open(path, "w", encoding='utf-8') as f:
                 f.write(s)
@@ -612,6 +612,8 @@ class Network(Logger, NetworkRetryManager[ServerAddr]):
 
     def update_fee_estimates(self, *, fee_est: Dict[int, int] = None):
         if fee_est is None:
+            if self.config.TEST_DISABLE_AUTOMATIC_FEE_ETA_UPDATE:
+                return
             fee_est = self.get_fee_estimates()
         for nblock_target, fee in fee_est.items():
             self.fee_estimates.set_data(nblock_target, fee)
@@ -1069,7 +1071,7 @@ class Network(Logger, NetworkRetryManager[ServerAddr]):
             raise RequestTimedOut()
         await self.interface.broadcast_transaction(tx, timeout=timeout)
 
-    async def try_broadcasting(self, tx, name) -> bool:
+    async def try_broadcasting(self, tx: 'Transaction', name: str) -> bool:
         try:
             await self.broadcast_transaction(tx)
         except Exception as e:
@@ -1155,19 +1157,15 @@ class Network(Logger, NetworkRetryManager[ServerAddr]):
         chosen_iface = random.choice(interfaces_on_selected_chain)  # type: Interface
         # switch to server (and save to config)
         net_params = self.get_parameters()
-        net_params = net_params._replace(server=chosen_iface.server)
+        # we select a random interface, so set connection mode back to autoconnect
+        net_params = net_params._replace(server=chosen_iface.server, auto_connect=True, oneserver=False)
         await self.set_parameters(net_params)
 
-    async def follow_chain_given_server(self, server: ServerAddr) -> None:
+    def follow_chain_given_server(self, server: ServerAddr) -> None:
         # note that server_str should correspond to a connected interface
-        iface = self.interfaces.get(server)
-        if iface is None:
-            return
+        iface = self.interfaces[server]
         self._set_preferred_chain(iface.blockchain)
-        # switch to server (and save to config)
-        net_params = self.get_parameters()
-        net_params = net_params._replace(server=server)
-        await self.set_parameters(net_params)
+        self.logger.debug(f"following {self.config.BLOCKCHAIN_PREFERRED_BLOCK=}")
 
     def get_server_height(self) -> int:
         """Length of header chain, as claimed by main interface."""

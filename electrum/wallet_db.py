@@ -73,7 +73,7 @@ class WalletUnfinished(WalletFileException):
 # seed_version is now used for the version of the wallet file
 OLD_SEED_VERSION = 4        # electrum versions < 2.0
 NEW_SEED_VERSION = 11       # electrum versions >= 2.0
-FINAL_SEED_VERSION = 60     # electrum >= 2.7 will set this to prevent
+FINAL_SEED_VERSION = 61     # electrum >= 2.7 will set this to prevent
                             # old versions from overwriting new format
 
 
@@ -236,6 +236,7 @@ class WalletDBUpgrader(Logger):
         self._convert_version_58()
         self._convert_version_59()
         self._convert_version_60()
+        self._convert_version_61()
         self.put('seed_version', FINAL_SEED_VERSION)  # just to be sure
 
     def _convert_wallet_type(self):
@@ -1157,6 +1158,18 @@ class WalletDBUpgrader(Logger):
                 cb['multisig_funding_privkey'] = None
         self.data['seed_version'] = 60
 
+    def _convert_version_61(self):
+        if not self._is_upgrade_method_needed(60, 60):
+            return
+        # adding additional fields to PaymentInfo
+        lightning_payments = self.data.get('lightning_payments', {})
+        expiry_never = 100 * 365 * 24 * 60 * 60
+        migration_time = int(time.time())
+        for rhash, (amount_msat, direction, is_paid) in list(lightning_payments.items()):
+            new = (amount_msat, direction, is_paid, 147, expiry_never, migration_time)
+            lightning_payments[rhash] = new
+        self.data['seed_version'] = 61
+
     def _convert_imported(self):
         if not self._is_upgrade_method_needed(0, 13):
             return
@@ -1266,7 +1279,7 @@ def upgrade_wallet_db(data: dict, do_upgrade: bool) -> Tuple[dict, bool]:
             first_electrum_version_used=ELECTRUM_VERSION,
         )
         assert data.get("db_metadata", None) is None
-        data["db_metadata"] = v
+        data["db_metadata"] = v.to_json()
         was_upgraded = True
 
     dbu = WalletDBUpgrader(data)
@@ -1508,7 +1521,7 @@ class WalletDB(JsonDB):
         if txid not in self.verified_tx:
             return None
         height, timestamp, txpos, header_hash = self.verified_tx[txid]
-        return TxMinedInfo(height=height,
+        return TxMinedInfo(_height=height,
                            conf=None,
                            timestamp=timestamp,
                            txpos=txpos,
@@ -1518,7 +1531,9 @@ class WalletDB(JsonDB):
     def add_verified_tx(self, txid: str, info: TxMinedInfo):
         assert isinstance(txid, str)
         assert isinstance(info, TxMinedInfo)
-        self.verified_tx[txid] = (info.height, info.timestamp, info.txpos, info.header_hash)
+        height = info._height  # number of conf is dynamic and might not be set here
+        assert height > 0, height
+        self.verified_tx[txid] = (height, info.timestamp, info.txpos, info.header_hash)
 
     @modifier
     def remove_verified_tx(self, txid: str):

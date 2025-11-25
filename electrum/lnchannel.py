@@ -17,6 +17,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
+import dataclasses
 import enum
 from collections import defaultdict
 from enum import IntEnum, Enum
@@ -336,9 +337,9 @@ class AbstractChannel(Logger, ABC):
                              closing_txid: str, closing_height: TxMinedInfo, keep_watching: bool) -> None:
         # note: state transitions are irreversible, but
         # save_funding_height, save_closing_height are reversible
-        if funding_height.height == TX_HEIGHT_LOCAL:
+        if funding_height.height() == TX_HEIGHT_LOCAL:
             self.update_unfunded_state()
-        elif closing_height.height == TX_HEIGHT_LOCAL:
+        elif closing_height.height() == TX_HEIGHT_LOCAL:
             self.update_funded_state(
                 funding_txid=funding_txid,
                 funding_height=funding_height)
@@ -401,11 +402,11 @@ class AbstractChannel(Logger, ABC):
                 self.lnworker.remove_channel(self.channel_id)
 
     def update_funded_state(self, *, funding_txid: str, funding_height: TxMinedInfo) -> None:
-        self.save_funding_height(txid=funding_txid, height=funding_height.height, timestamp=funding_height.timestamp)
+        self.save_funding_height(txid=funding_txid, height=funding_height.height(), timestamp=funding_height.timestamp)
         self.delete_closing_height()
         if funding_height.conf>0:
             self.set_short_channel_id(ShortChannelID.from_components(
-                funding_height.height, funding_height.txpos, self.funding_outpoint.output_index))
+                funding_height.height(), funding_height.txpos, self.funding_outpoint.output_index))
         if self.get_state() == ChannelState.OPENING:
             if self.is_funding_tx_mined(funding_height):
                 self.set_state(ChannelState.FUNDED)
@@ -423,11 +424,11 @@ class AbstractChannel(Logger, ABC):
 
     def update_closed_state(self, *, funding_txid: str, funding_height: TxMinedInfo,
                             closing_txid: str, closing_height: TxMinedInfo, keep_watching: bool) -> None:
-        self.save_funding_height(txid=funding_txid, height=funding_height.height, timestamp=funding_height.timestamp)
-        self.save_closing_height(txid=closing_txid, height=closing_height.height, timestamp=closing_height.timestamp)
+        self.save_funding_height(txid=funding_txid, height=funding_height.height(), timestamp=funding_height.timestamp)
+        self.save_closing_height(txid=closing_txid, height=closing_height.height(), timestamp=closing_height.timestamp)
         if funding_height.conf>0:
             self.set_short_channel_id(ShortChannelID.from_components(
-                funding_height.height, funding_height.txpos, self.funding_outpoint.output_index))
+                funding_height.height(), funding_height.txpos, self.funding_outpoint.output_index))
         if self.get_state() < ChannelState.CLOSED:
             conf = closing_height.conf
             if conf > 0:
@@ -772,7 +773,7 @@ class Channel(AbstractChannel):
         Logger.__init__(self)  # should be after short_channel_id is set
         self.lnworker = lnworker
         self.storage = state
-        self.db_lock = self.storage.db.lock if self.storage.db else threading.RLock()
+        self.db_lock = self.storage.lock
         self.config = {}
         self.config[LOCAL] = state["local_config"]
         self.config[REMOTE] = state["remote_config"]
@@ -1202,12 +1203,10 @@ class Channel(AbstractChannel):
         """Adds a new LOCAL HTLC to the channel.
         Action must be initiated by LOCAL.
         """
-        if isinstance(htlc, dict):  # legacy conversion  # FIXME remove
-            htlc = UpdateAddHtlc(**htlc)
         assert isinstance(htlc, UpdateAddHtlc)
         self._assert_can_add_htlc(htlc_proposer=LOCAL, amount_msat=htlc.amount_msat)
         if htlc.htlc_id is None:
-            htlc = attr.evolve(htlc, htlc_id=self.hm.get_next_htlc_id(LOCAL))
+            htlc = dataclasses.replace(htlc, htlc_id=self.hm.get_next_htlc_id(LOCAL))
         with self.db_lock:
             self.hm.send_htlc(htlc)
         self.logger.info("add_htlc")
@@ -1217,15 +1216,13 @@ class Channel(AbstractChannel):
         """Adds a new REMOTE HTLC to the channel.
         Action must be initiated by REMOTE.
         """
-        if isinstance(htlc, dict):  # legacy conversion  # FIXME remove
-            htlc = UpdateAddHtlc(**htlc)
         assert isinstance(htlc, UpdateAddHtlc)
         try:
             self._assert_can_add_htlc(htlc_proposer=REMOTE, amount_msat=htlc.amount_msat)
         except PaymentFailure as e:
             raise RemoteMisbehaving(e) from e
         if htlc.htlc_id is None:  # used in unit tests
-            htlc = attr.evolve(htlc, htlc_id=self.hm.get_next_htlc_id(REMOTE))
+            htlc = dataclasses.replace(htlc, htlc_id=self.hm.get_next_htlc_id(REMOTE))
         with self.db_lock:
             self.hm.recv_htlc(htlc)
             if onion_packet:

@@ -36,6 +36,7 @@ import queue
 import asyncio
 from typing import Optional, TYPE_CHECKING, Sequence, Union, Dict, Mapping, Callable, List, Set
 import concurrent.futures
+import inspect
 
 from PyQt6.QtGui import QPixmap, QKeySequence, QIcon, QCursor, QFont, QFontMetrics, QAction, QShortcut
 from PyQt6.QtCore import Qt, QRect, QStringListModel, QSize, pyqtSignal, QTimer
@@ -107,6 +108,7 @@ from electrum.gui.common_qt.util import TaskThread
 if TYPE_CHECKING:
     from . import ElectrumGui
     from electrum.submarine_swaps import SwapOffer
+    from electrum.lnchannel import Channel
 
 
 class StatusBarButton(QToolButton):
@@ -1258,32 +1260,43 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger, QtEventListener):
     def protect(self, func, args, password):
         return func(*args, password)
 
-    def run_swap_dialog(self, is_reverse=None, recv_amount_sat=None, channels=None):
+    def run_swap_dialog(
+        self,
+        is_reverse: Optional[bool] = None,
+        recv_amount_sat_or_max: Optional[Union[int, str]] = None,
+        channels: Optional[Sequence['Channel']] = None,
+    ) -> bool:
         if not self.network:
             self.show_error(_("You are offline."))
-            return
+            return False
         if not self.wallet.lnworker:
             self.show_error(_('Lightning is disabled'))
-            return
+            return False
         if not self.wallet.lnworker.num_sats_can_send() and not self.wallet.lnworker.num_sats_can_receive():
             self.show_error(_("You do not have liquidity in your active channels."))
-            return
+            return False
 
         transport = self.create_sm_transport()
         if not transport:
-            return
+            return False
 
         with transport:
             if not self.initialize_swap_manager(transport):
-                return
-            d = SwapDialog(self, transport, is_reverse=is_reverse, recv_amount_sat=recv_amount_sat, channels=channels)
+                return False
+            d = SwapDialog(
+                self,
+                transport,
+                is_reverse=is_reverse,
+                recv_amount_sat_or_max=recv_amount_sat_or_max,
+                channels=channels
+            )
             try:
                 return d.run(transport)
             except InvalidSwapParameters as e:
                 self.show_error(str(e))
-                return
+                return False
             except UserCancelled:
-                return
+                return False
 
     def create_sm_transport(self) -> Optional['SwapServerTransport']:
         sm = self.wallet.lnworker.swap_manager
@@ -1496,15 +1509,8 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger, QtEventListener):
             return
         self._open_channel(connect_str, funding_sat, push_amt, funding_tx)
 
-    def confirm_tx_dialog(self, make_tx, output_value, allow_preview=True, batching_candidates=None):
+    def confirm_tx_dialog(self, make_tx, output_value, *, allow_preview=True, batching_candidates=None) -> tuple[Optional[PartialTransaction], bool]:
         d = ConfirmTxDialog(window=self, make_tx=make_tx, output_value=output_value, allow_preview=allow_preview, batching_candidates=batching_candidates)
-        if d.not_enough_funds:  # FIXME this check looks broken?
-            # note: use confirmed_only=False here, regardless of config setting,
-            #       as the user needs to get to ConfirmTxDialog to change the config setting
-            if not d.can_pay_assuming_zero_fees(confirmed_only=False):
-                text = self.wallet.get_text_not_enough_funds_mentioning_frozen(for_amount=output_value)
-                self.show_message(text)
-                return
         return d.run(), d.is_preview
 
     @protected
@@ -1798,7 +1804,7 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger, QtEventListener):
 
     def show_balance_dialog(self):
         balance = self.wallet.get_balances_for_piechart().total()
-        if balance == 0:
+        if balance == 0 and not self.balance_label.has_warning:
             return
         from .balance_dialog import BalanceDialog
         d = BalanceDialog(self, wallet=self.wallet)
@@ -2591,14 +2597,14 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger, QtEventListener):
             if bitcoin.is_address(addr):
                 return addr
 
-        def get_pk(*, raise_on_error=False):
+        def get_pk(*, raise_on_error=False) -> Sequence[str]:
             text = str(keys_e.toPlainText())
             return keystore.get_private_keys(text, raise_on_error=raise_on_error)
 
         def on_edit():
             valid_privkeys = False
             try:
-                valid_privkeys = get_pk(raise_on_error=True) is not None
+                valid_privkeys = bool(get_pk(raise_on_error=True))
             except Exception as e:
                 button.setToolTip(f'{_("Error")}: {repr(e)}')
             else:
@@ -2734,7 +2740,7 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger, QtEventListener):
         Registers a callback that will be called when the wallet is closed. If the callback
         returns a string it will be shown to the user as a warning to prevent them closing the wallet.
         """
-        assert not asyncio.iscoroutinefunction(callback)
+        assert not inspect.iscoroutinefunction(callback)
         def warning_callback() -> Optional[str]:
             try:
                 return callback()
@@ -2745,7 +2751,7 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger, QtEventListener):
         self.closing_warning_callbacks.append(warning_callback)
 
     def _check_ongoing_force_closures(self) -> Optional[str]:
-        from electrum.lnutil import MIN_FINAL_CLTV_DELTA_FOR_INVOICE
+        from electrum.lnutil import MIN_FINAL_CLTV_DELTA_ACCEPTED
         if not self.wallet.has_lightning():
             return None
         if not self.network:
@@ -2754,7 +2760,7 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger, QtEventListener):
         if not force_closes:
             return
         # fixme: this is inaccurate, we need local_height - cltv_of_htlc
-        cltv_delta = MIN_FINAL_CLTV_DELTA_FOR_INVOICE
+        cltv_delta = MIN_FINAL_CLTV_DELTA_ACCEPTED
         msg = '\n\n'.join([
             _("Pending channel force-close"),
             messages.MSG_FORCE_CLOSE_WARNING.format(cltv_delta),
@@ -2905,7 +2911,7 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger, QtEventListener):
             return
         fee = fee_e.get_amount()
         if fee is None:
-            return  # fee left empty, treat is as "cancel"
+            return  # fee left empty, treat it as "cancel"
         if fee > max_fee:
             self.show_error(_('Max fee exceeded'))
             return

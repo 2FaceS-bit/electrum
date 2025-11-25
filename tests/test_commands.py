@@ -1,3 +1,4 @@
+import asyncio
 import binascii
 import datetime
 import os.path
@@ -14,6 +15,7 @@ from electrum.lnworker import RecvMPPResolution
 from electrum.wallet import Abstract_Wallet
 from electrum.address_synchronizer import TX_HEIGHT_UNCONFIRMED
 from electrum.simple_config import SimpleConfig
+from electrum.submarine_swaps import SwapOffer, SwapFees, NostrTransport
 from electrum.transaction import Transaction, TxOutput, tx_from_any
 from electrum.util import UserFacingException, NotEnoughFunds
 from electrum.crypto import sha256
@@ -170,6 +172,22 @@ class TestCommands(ElectrumTestCase):
         with self.assertRaises(binascii.Error):  # perhaps it should raise some nice UserFacingException instead
             await cmds.decrypt(pubkey, ciphertext+"trailinggarbage", wallet=wallet)
 
+    def test_format_satoshis(self):
+        format_satoshis = electrum.commands.format_satoshis
+        # input type is highly polymorphic:
+        self.assertEqual(format_satoshis(None), None)
+        self.assertEqual(format_satoshis(1), "0.00000001")
+        self.assertEqual(format_satoshis(1.0), "0.00000001")
+        self.assertEqual(format_satoshis(Decimal(1)), "0.00000001")
+        # trailing zeroes are cut
+        self.assertEqual(format_satoshis(51000), "0.00051")
+        self.assertEqual(format_satoshis(123456_12345670), "123456.1234567")
+        # sub-satoshi precision is rounded
+        self.assertEqual(format_satoshis(Decimal(123.456)), "0.00000123")
+        self.assertEqual(format_satoshis(Decimal(123.5)), "0.00000124")
+        self.assertEqual(format_satoshis(Decimal(123.789)), "0.00000124")
+        self.assertEqual(format_satoshis(41754.681), "0.00041755")
+
 
 class TestCommandsTestnet(ElectrumTestCase):
     TESTNET = True
@@ -295,6 +313,14 @@ class TestCommandsTestnet(ElectrumTestCase):
             locktime=1972344,
             wallet=wallet)
 
+        tx_str_2 = await cmds.payto(
+            destination="tb1qsyzgpwa0vg2940u5t6l97etuvedr5dejpf9tdy",
+            amount="0.00123456",
+            feerate="50.000",  # test that passing a string feerate results in the same tx
+            locktime=1972344,
+            wallet=wallet)
+
+        self.assertEqual(tx_str, tx_str_2)
         tx = tx_from_any(tx_str)
         self.assertEqual(2, len(tx.outputs()))
         txout = TxOutput.from_address_and_value("tb1qsyzgpwa0vg2940u5t6l97etuvedr5dejpf9tdy", 123456)
@@ -530,7 +556,7 @@ class TestCommandsTestnet(ElectrumTestCase):
         mock_htlc2.amount_msat = 5_500_000
         mock_htlc_status = mock.Mock()
         mock_htlc_status.htlc_set = [(None, mock_htlc1), (None, mock_htlc2)]
-        mock_htlc_status.resolution = RecvMPPResolution.ACCEPTED
+        mock_htlc_status.resolution = RecvMPPResolution.COMPLETE
 
         payment_key = wallet.lnworker._get_payment_key(bytes.fromhex(payment_hash)).hex()
         with mock.patch.dict(wallet.lnworker.received_mpp_htlcs, {payment_key: mock_htlc_status}):
@@ -555,6 +581,7 @@ class TestCommandsTestnet(ElectrumTestCase):
             assert settled_status['status'] == 'settled'
             assert settled_status['received_amount_sat'] == 10000
             assert settled_status['invoice_amount_sat'] == 10000
+            assert settled_status['preimage'] == preimage.hex()
 
         with self.assertRaises(AssertionError):
             # cancelling a settled invoice should raise
@@ -640,3 +667,120 @@ class TestCommandsTestnet(ElectrumTestCase):
                     "fiat_value": "-40.51",
                 }
             )
+
+    @mock.patch.object(wallet.Abstract_Wallet, 'save_db')
+    async def test_get_submarine_swap_providers(self, *mock_args):
+        wallet = restore_wallet_from_text__for_unittest(
+            'disagree rug lemon bean unaware square alone beach tennis exhibit fix mimic',
+            path='if_this_exists_mocking_failed_648151893',
+            config=self.config)['wallet']
+
+        cmds = Commands(config=self.config)
+
+        offer1 = SwapOffer(
+            pairs=SwapFees(
+                percentage=0.5,
+                mining_fee=2000,
+                min_amount=10000,
+                max_forward=1000000,
+                max_reverse=500000
+            ),
+            relays=["wss://relay1.example.com", "wss://relay2.example.com"],
+            timestamp=1640995200,
+            server_pubkey="a8cffad54f59e2c50a1d40ec0d57f1fc32df9cd2101fad8000215eb4a75b334d",
+            pow_bits=10
+        )
+
+        offer2 = SwapOffer(
+            pairs=SwapFees(
+                percentage=1.0,
+                mining_fee=3000,
+                min_amount=20000,
+                max_forward=2000000,
+                max_reverse=1000000
+            ),
+            relays=["ws://relay3.example.onion", "wss://relay4.example.com"],
+            timestamp=1640995300,
+            server_pubkey="7a483b6546be900481f6be2d2cc1b47c779ee89b4b66d1a066a8dc81c63ad1f0",
+            pow_bits=12
+        )
+        mock_offers = [offer1, offer2]
+        mock_transport = mock.Mock(NostrTransport)
+        mock_transport.get_recent_offers.return_value = mock_offers
+
+        with mock.patch.object(
+            wallet.lnworker.swap_manager,
+            'create_transport'
+        ) as mock_create_transport:
+            mock_create_transport.return_value.__aenter__.return_value = mock_transport
+
+            result = await cmds.get_submarine_swap_providers(query_time=1, wallet=wallet)
+
+        expected_result = {
+            offer1.server_npub: {
+                "percentage_fee": offer1.pairs.percentage,
+                "max_forward_sat": offer1.pairs.max_forward,
+                "max_reverse_sat": offer1.pairs.max_reverse,
+                "min_amount_sat": offer1.pairs.min_amount,
+                "prepayment": 2 * offer1.pairs.mining_fee,
+            },
+            offer2.server_npub: {
+                "percentage_fee": offer2.pairs.percentage,
+                "max_forward_sat": offer2.pairs.max_forward,
+                "max_reverse_sat": offer2.pairs.max_reverse,
+                "min_amount_sat": offer2.pairs.min_amount,
+                "prepayment": 2 * offer2.pairs.mining_fee,
+            }
+        }
+        self.assertEqual(result, expected_result)
+
+    @mock.patch.object(wallet.Abstract_Wallet, 'save_db')
+    async def test_export_lightning_preimage(self, *mock_args):
+        w = restore_wallet_from_text__for_unittest(
+            'disagree rug lemon bean unaware square alone beach tennis exhibit fix mimic',
+            path='if_this_exists_mocking_failed_648151893',
+            config=self.config)['wallet']
+        cmds = Commands(config=self.config)
+
+        preimage = os.urandom(32)
+        payment_hash = sha256(preimage)
+        w.lnworker.save_preimage(payment_hash, preimage)
+
+        assert await cmds.export_lightning_preimage(payment_hash=payment_hash.hex(), wallet=w) == preimage.hex()
+        assert await cmds.export_lightning_preimage(payment_hash=os.urandom(32).hex(), wallet=w) is None
+
+    @mock.patch.object(wallet.Abstract_Wallet, 'save_db')
+    @mock.patch('electrum.commands.LN_P2P_NETWORK_TIMEOUT', 0.001)
+    async def test_add_peer(self, *mock_args):
+        w = restore_wallet_from_text__for_unittest(
+            'disagree rug lemon bean unaware square alone beach tennis exhibit fix mimic',
+            path='if_this_exists_mocking_failed_648151893',
+            config=self.config)['wallet']
+        cmds = Commands(config=self.config)
+
+        # Mock the network and lnworker
+        mock_lnworker = mock.Mock()
+        w.lnworker = mock_lnworker
+        mock_peer = mock.Mock()
+        mock_peer.initialized = asyncio.Future()
+        connection_string = "test_node_id@127.0.0.1:9735"
+        called = False
+        async def lnworker_add_peer(*args, **kwargs):
+            assert args[0] == connection_string
+            nonlocal called
+            called += 1
+            return mock_peer
+        mock_lnworker.add_peer = lnworker_add_peer
+
+        # check if add_peer times out if peer doesn't initialize (LN_P2P_NETWORK_TIMEOUT is 0.001s)
+        with self.assertRaises(UserFacingException):
+            await cmds.add_peer(connection_string=connection_string, wallet=w)
+        # check if add_peer called lnworker.add_peer
+        assert called == 1
+
+        mock_peer.initialized = asyncio.Future()
+        mock_peer.initialized.set_result(True)
+        # check if add_peer returns True if peer is initialized
+        result = await cmds.add_peer(connection_string=connection_string, wallet=w)
+        assert called == 2
+        self.assertTrue(result)

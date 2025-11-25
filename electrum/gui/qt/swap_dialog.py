@@ -27,6 +27,7 @@ from .my_treeview import create_toolbar_with_menu, MyTreeView
 if TYPE_CHECKING:
     from .main_window import ElectrumWindow
     from electrum.submarine_swaps import SwapServerTransport, SwapOffer
+    from electrum.lnchannel import Channel
 
 CANNOT_RECEIVE_WARNING = _(
 """The requested amount is higher than what you can receive in your currently open channels.
@@ -43,7 +44,14 @@ class InvalidSwapParameters(Exception): pass
 
 class SwapDialog(WindowModalDialog, QtEventListener):
 
-    def __init__(self, window: 'ElectrumWindow', transport: 'SwapServerTransport', is_reverse=None, recv_amount_sat=None, channels=None):
+    def __init__(
+        self,
+        window: 'ElectrumWindow',
+        transport: 'SwapServerTransport',
+        is_reverse: Optional[bool] = None,
+        recv_amount_sat_or_max: Optional[Union[int, str]] = None,  # sat or '!'
+        channels: Optional[Sequence['Channel']] = None,
+    ):
         WindowModalDialog.__init__(self, window, _('Submarine Swap'))
         self.window = window
         self.config = window.config
@@ -81,9 +89,6 @@ class SwapDialog(WindowModalDialog, QtEventListener):
         # textEdited is triggered only for user editing of the fields
         self.send_amount_e.textEdited.connect(self.uncheck_max)
         self.recv_amount_e.textEdited.connect(self.uncheck_max)
-        self.send_amount_e.setEnabled(recv_amount_sat is None)
-        self.recv_amount_e.setEnabled(recv_amount_sat is None)
-        self.max_button.setEnabled(recv_amount_sat is None)
 
         self.fee_policy = FeePolicy(self.config.FEE_POLICY)
         self.fee_slider = FeeSlider(parent=self, network=self.network, fee_policy=self.fee_policy, callback=self.fee_slider_callback)
@@ -94,6 +99,7 @@ class SwapDialog(WindowModalDialog, QtEventListener):
         self.swap_limits_label = QLabel()
         self.fee_label = QLabel()
         self.server_fee_label = QLabel()
+        self.last_server_mining_fee_sat = None
         h = QGridLayout()
         h.addWidget(self.description_label, 0, 0, 1, 3)
         h.addWidget(self.toggle_button, 0, 3)
@@ -122,8 +128,9 @@ class SwapDialog(WindowModalDialog, QtEventListener):
         buttons = Buttons(CancelButton(self), self.ok_button)
         vbox.addLayout(buttons)
         buttons.insertWidget(0, self.server_button)
-        if recv_amount_sat:
-            self.init_recv_amount(recv_amount_sat)
+        if recv_amount_sat_or_max:
+            assert isinstance(recv_amount_sat_or_max, (int, str)), f"invalid {type(recv_amount_sat_or_max)=}"
+            self.init_recv_amount(recv_amount_sat_or_max)
         self.update()
         self.needs_tx_update = True
 
@@ -153,7 +160,12 @@ class SwapDialog(WindowModalDialog, QtEventListener):
     @qt_event_listener
     def on_event_swap_offers_changed(self, recent_offers: Sequence['SwapOffer']):
         self.set_server_button_text(len(recent_offers))
-        self.update()
+        if not self.ok_button.isEnabled():
+            # only update the dialog with the new offer if the user hasn't entered an amount yet.
+            # if the user has already entered an amount we prefer the swap to fail due to outdated
+            # fees than the possibility of a swap happening with fees the user hasn't seen
+            # due to an update happening just before the user initiated the swap
+            self.update()
 
     def set_server_button_text(self, offer_count: int):
         button_text = f' {offer_count} ' + (_('providers') if offer_count != 1 else _('provider'))
@@ -276,14 +288,14 @@ class SwapDialog(WindowModalDialog, QtEventListener):
         min_swap_limit, max_swap_limit = self.get_client_swap_limits_sat()
         if max_swap_limit == 0:
             swap_name = _("reverse") if self.is_reverse else _("forward")
-            swap_limit_str = _("No {} swap possible").format(swap_name)
+            swap_limit_str = _("No {} swap possible with this provider").format(swap_name)
         else:
             swap_limit_str = (f"{self.window.format_amount(min_swap_limit)} - "
                               f"{self.window.format_amount(max_swap_limit)} {w_base_unit}")
         self.swap_limits_label.setText(swap_limit_str)
         self.swap_limits_label.repaint()  # macOS hack for #6269
-        server_mining_fee = sm.mining_fee
-        server_fee_str = '%.2f'%sm.percentage + '%  +  '  + self.window.format_amount(server_mining_fee) + ' ' + w_base_unit
+        self.last_server_mining_fee_sat = sm.mining_fee
+        server_fee_str = '%.2f'%sm.percentage + '%  +  '  + self.window.format_amount(sm.mining_fee) + ' ' + w_base_unit
         self.server_fee_label.setText(server_fee_str)
         self.server_fee_label.repaint()  # macOS hack for #6269
         self.needs_tx_update = True
@@ -318,37 +330,38 @@ class SwapDialog(WindowModalDialog, QtEventListener):
         self.fee_label.setText(fee_text)
         self.fee_label.repaint()  # macOS hack for #6269
 
-    def run(self, transport):
+    def run(self, transport: 'SwapServerTransport') -> bool:
         """Can raise InvalidSwapParameters."""
         if not self.exec():
-            return
+            return False
         if self.is_reverse:
             lightning_amount = self.send_amount_e.get_amount()
             onchain_amount = self.recv_amount_e.get_amount()
             if lightning_amount is None or onchain_amount is None:
-                return
+                return False
             sm = self.swap_manager
             coro = sm.reverse_swap(
                 transport=transport,
                 lightning_amount_sat=lightning_amount,
                 expected_onchain_amount_sat=onchain_amount + self.swap_manager.get_fee_for_txbatcher(),
+                prepayment_sat=2 * self.last_server_mining_fee_sat,
             )
             try:
                 # we must not leave the context, so we use run_couroutine_dialog
                 funding_txid = self.window.run_coroutine_dialog(coro, _('Initiating swap...'))
             except Exception as e:
                 self.window.show_error(f"Reverse swap failed: {str(e)}")
-                return
+                return False
             self.window.on_swap_result(funding_txid, is_reverse=True)
             return True
         else:
             lightning_amount = self.recv_amount_e.get_amount()
             onchain_amount = self.send_amount_e.get_amount()
             if lightning_amount is None or onchain_amount is None:
-                return
+                return False
             if lightning_amount > self.lnworker.num_sats_can_receive():
                 if not self.window.question(CANNOT_RECEIVE_WARNING):
-                    return
+                    return False
             self.window.protect(self.do_normal_swap, (transport, lightning_amount, onchain_amount))
             return True
 

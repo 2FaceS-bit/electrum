@@ -32,6 +32,7 @@ from typing import (
     NamedTuple, Union, TYPE_CHECKING, Tuple, Optional, Callable, Any, Sequence, Dict, Generic, TypeVar, List, Iterable,
     Set, Awaitable
 )
+from types import MappingProxyType
 from datetime import datetime, timezone, timedelta
 import decimal
 from decimal import Decimal
@@ -52,8 +53,9 @@ import functools
 from functools import partial
 from abc import abstractmethod, ABC
 import enum
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 import traceback
+import inspect
 
 import aiohttp
 from aiohttp_socks import ProxyConnector, ProxyType
@@ -234,6 +236,8 @@ def to_decimal(x: Union[str, float, int, Decimal]) -> Decimal:
     #   Decimal('41754.681')
     if isinstance(x, Decimal):
         return x
+    if isinstance(x, int):
+        return Decimal(x)
     return Decimal(str(x))
 
 
@@ -363,7 +367,11 @@ class DebugMem(ThreadJob):
         objmap = defaultdict(list)
         for obj in gc.get_objects():
             for class_ in self.classes:
-                if isinstance(obj, class_):
+                try:
+                    _isinstance = isinstance(obj, class_)
+                except AttributeError:
+                    _isinstance = False
+                if _isinstance:
                     objmap[class_].append(obj)
         for class_, objs in objmap.items():
             self.logger.info(f"{class_.__name__}: {len(objs)}")
@@ -498,7 +506,7 @@ def profiler(func=None, *, min_threshold: Union[int, float, None] = None):
         if min_threshold is None or t > min_threshold:
             _profiler_logger.debug(f"{func.__qualname__} {t:,.4f} sec")
 
-    if asyncio.iscoroutinefunction(func):
+    if inspect.iscoroutinefunction(func):
         async def do_profile(*args, **kw_args):
             timer_start()
             o = await func(*args, **kw_args)
@@ -793,14 +801,17 @@ def format_satoshis_plain(
         x: Union[int, float, Decimal, str],  # amount in satoshis,
         *,
         decimal_point: int = 8,  # how much to shift decimal point to left (default: sat->BTC)
+        is_max_allowed: bool = True,
 ) -> str:
     """Display a satoshi amount scaled.  Always uses a '.' as a decimal
     point and has no thousands separator"""
-    if parse_max_spend(x):
+    if is_max_allowed and parse_max_spend(x):
         return f'max({x})'
     assert isinstance(x, (int, float, Decimal)), f"{x!r} should be a number"
+    # TODO(ghost43) just hard-fail if x is a float. do we even use floats for money anywhere?
+    x = to_decimal(x)
     scale_factor = pow(10, decimal_point)
-    return "{:.8f}".format(Decimal(x) / scale_factor).rstrip('0').rstrip('.')
+    return "{:.8f}".format(x / scale_factor).rstrip('0').rstrip('.')
 
 
 # Check that Decimal precision is sufficient.
@@ -832,8 +843,10 @@ def format_satoshis(
     if parse_max_spend(x):
         return f'max({x})'
     assert isinstance(x, (int, float, Decimal)), f"{x!r} should be a number"
+    # TODO(ghost43) just hard-fail if x is a float. do we even use floats for money anywhere?
+    x = to_decimal(x)
     # lose redundant precision
-    x = Decimal(x).quantize(Decimal(10) ** (-precision))
+    x = x.quantize(Decimal(10) ** (-precision))
     # format string
     overall_precision = decimal_point + precision  # max digits after final decimal point
     decimal_format = "." + str(overall_precision) if overall_precision > 0 else ""
@@ -1211,7 +1224,7 @@ def is_subpath(long_path: str, short_path: str) -> bool:
 
 def log_exceptions(func):
     """Decorator to log AND re-raise exceptions."""
-    assert asyncio.iscoroutinefunction(func), 'func needs to be a coroutine'
+    assert inspect.iscoroutinefunction(func), 'func needs to be a coroutine'
 
     @functools.wraps(func)
     async def wrapper(*args, **kwargs):
@@ -1232,7 +1245,7 @@ def log_exceptions(func):
 
 def ignore_exceptions(func):
     """Decorator to silently swallow all exceptions."""
-    assert asyncio.iscoroutinefunction(func), 'func needs to be a coroutine'
+    assert inspect.iscoroutinefunction(func), 'func needs to be a coroutine'
 
     @functools.wraps(func)
     async def wrapper(*args, **kwargs):
@@ -1252,26 +1265,37 @@ def with_lock(func):
     return func_wrapper
 
 
-class TxMinedInfo(NamedTuple):
-    height: int                        # height of block that mined tx
+@dataclass(frozen=True, kw_only=True)
+class TxMinedInfo:
+    _height: int                       # height of block that mined tx
     conf: Optional[int] = None         # number of confirmations, SPV verified. >=0, or None (None means unknown)
     timestamp: Optional[int] = None    # timestamp of block that mined tx
     txpos: Optional[int] = None        # position of tx in serialized block
     header_hash: Optional[str] = None  # hash of block that mined tx
     wanted_height: Optional[int] = None  # in case of timelock, min abs block height
 
+    def height(self) -> int:
+        """Treat unverified heights as unconfirmed."""
+        h = self._height
+        if h > 0:
+            if self.conf is not None and self.conf >= 1:
+                return h
+            return 0  # treat it as unconfirmed until SPV-ed
+        else:  # h <= 0
+            return h
+
     def short_id(self) -> Optional[str]:
         if self.txpos is not None and self.txpos >= 0:
-            assert self.height > 0
-            return f"{self.height}x{self.txpos}"
+            assert self.height() > 0
+            return f"{self.height()}x{self.txpos}"
         return None
 
     def is_local_like(self) -> bool:
         """Returns whether the tx is local-like (LOCAL/FUTURE)."""
         from .address_synchronizer import TX_HEIGHT_UNCONFIRMED, TX_HEIGHT_UNCONF_PARENT
-        if self.height > 0:
+        if self.height() > 0:
             return False
-        if self.height in (TX_HEIGHT_UNCONFIRMED, TX_HEIGHT_UNCONF_PARENT):
+        if self.height() in (TX_HEIGHT_UNCONFIRMED, TX_HEIGHT_UNCONF_PARENT):
             return False
         return True
 
@@ -1681,8 +1705,20 @@ def create_and_start_event_loop() -> Tuple[asyncio.AbstractEventLoop,
             loop.run_until_complete(stopping_fut)
         finally:
             # clean-up
+            try:
+                pending_tasks = asyncio.gather(*asyncio.all_tasks(loop), return_exceptions=True)
+                pending_tasks.cancel()
+                with suppress(asyncio.CancelledError):
+                    loop.run_until_complete(pending_tasks)
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                if isinstance(loop, asyncio.BaseEventLoop):
+                    loop.run_until_complete(loop.shutdown_default_executor())
+            except Exception as e:
+                _logger.debug(f"exception when cleaning up asyncio event loop: {e}")
+
             global _asyncio_event_loop
             _asyncio_event_loop = None
+            loop.close()
 
     loop.set_exception_handler(on_exception)
     _set_custom_task_factory(loop)
@@ -1742,7 +1778,7 @@ def _set_custom_task_factory(loop: asyncio.AbstractEventLoop):
     loop.set_task_factory(factory)
 
 
-def run_sync_function_on_asyncio_thread(func: Callable, *, block: bool) -> None:
+def run_sync_function_on_asyncio_thread(func: Callable[[], Any], *, block: bool) -> None:
     """Run a non-async fn on the asyncio thread. Can be called from any thread.
 
     If the current thread is already the asyncio thread, func is guaranteed
@@ -1750,7 +1786,7 @@ def run_sync_function_on_asyncio_thread(func: Callable, *, block: bool) -> None:
 
     For any other thread, we only wait for completion if `block` is True.
     """
-    assert not asyncio.iscoroutinefunction(func), "func must be a non-async function"
+    assert not inspect.iscoroutinefunction(func), "func must be a non-async function"
     asyncio_loop = get_asyncio_loop()
     if get_running_loop() == asyncio_loop:  # we are running on the asyncio thread
         func()
@@ -1838,6 +1874,21 @@ class OrderedDictWithIndex(OrderedDict):
             self._key_to_pos[key] = pos
             self._pos_to_key[pos] = key
         return ret
+
+
+def make_object_immutable(obj):
+    """Makes the passed object immutable recursively."""
+    allowed_types = (
+        dict, MappingProxyType, list, tuple, set, frozenset, str, int, float, bool, bytes, type(None)
+    )
+    assert isinstance(obj, allowed_types), f"{type(obj)=} cannot be made immutable"
+    if isinstance(obj, (dict, MappingProxyType)):
+        return MappingProxyType({k: make_object_immutable(v) for k, v in obj.items()})
+    elif isinstance(obj, (list, tuple)):
+        return tuple(make_object_immutable(item) for item in obj)
+    elif isinstance(obj, (set, frozenset)):
+        return frozenset(make_object_immutable(item) for item in obj)
+    return obj
 
 
 def multisig_type(wallet_type):
@@ -1930,20 +1981,24 @@ class CallbackManager(Logger):
     def __init__(self):
         Logger.__init__(self)
         self.callback_lock = threading.Lock()
-        self.callbacks = defaultdict(list)      # note: needs self.callback_lock
+        self.callbacks = defaultdict(list)  # type: Dict[str, List[Callable]]  # note: needs self.callback_lock
 
-    def register_callback(self, func, events):
+    def register_callback(self, func: Callable, events: Sequence[str]) -> None:
         with self.callback_lock:
             for event in events:
                 self.callbacks[event].append(func)
 
-    def unregister_callback(self, callback):
+    def unregister_callback(self, callback: Callable) -> None:
         with self.callback_lock:
             for callbacks in self.callbacks.values():
                 if callback in callbacks:
                     callbacks.remove(callback)
 
-    def trigger_callback(self, event, *args):
+    def clear_all_callbacks(self) -> None:
+        with self.callback_lock:
+            self.callbacks.clear()
+
+    def trigger_callback(self, event: str, *args) -> None:
         """Trigger a callback with given arguments.
         Can be called from any thread. The callback itself will get scheduled
         on the event loop.
@@ -1953,7 +2008,7 @@ class CallbackManager(Logger):
         with self.callback_lock:
             callbacks = self.callbacks[event][:]
         for callback in callbacks:
-            if asyncio.iscoroutinefunction(callback):  # async cb
+            if inspect.iscoroutinefunction(callback):  # async cb
                 fut = asyncio.run_coroutine_threadsafe(callback(*args), loop)
 
                 def on_done(fut_: concurrent.futures.Future):
@@ -2348,7 +2403,7 @@ class OnchainHistoryItem(NamedTuple):
             'txid': self.txid,
             'amount_sat': self.amount_sat,
             'fee_sat': self.fee_sat,
-            'height': self.tx_mined_status.height,
+            'height': self.tx_mined_status.height(),
             'confirmations': self.tx_mined_status.conf,
             'timestamp': self.tx_mined_status.timestamp,
             'monotonic_timestamp': self.monotonic_timestamp,

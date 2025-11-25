@@ -56,7 +56,7 @@ class WatchtowerPlugin(BasePlugin):
             return
 
         self.watchtower = WatchTower(self.network)
-        asyncio.ensure_future(self.watchtower.start_watching())
+        asyncio.run_coroutine_threadsafe(self.watchtower.start_watching(), self.network.asyncio_loop)
         if watchtower_port := self.config.WATCHTOWER_SERVER_PORT:
             self.server = WatchTowerServer(self.watchtower, self.network, watchtower_port)
             asyncio.run_coroutine_threadsafe(self.network.taskgroup.spawn(self.server.run), self.network.asyncio_loop)
@@ -218,7 +218,7 @@ class WatchTower(Logger, EventListener):
         return keep_watching
 
     async def broadcast_or_log(self, funding_outpoint: str, tx: Transaction):
-        height = self.adb.get_tx_height(tx.txid()).height
+        height = self.adb.get_tx_height(tx.txid()).height()
         if height != TX_HEIGHT_LOCAL:
             return
         try:

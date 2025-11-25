@@ -29,7 +29,7 @@ import struct
 import io
 import base64
 from typing import (
-    Sequence, Union, NamedTuple, Tuple, Optional, Iterable, Callable, List, Dict, Set, TYPE_CHECKING, Mapping
+    Sequence, Union, NamedTuple, Tuple, Optional, Iterable, Callable, List, Dict, Set, TYPE_CHECKING, Mapping, Any
 )
 from collections import defaultdict
 from enum import IntEnum
@@ -203,6 +203,9 @@ class TxOutput:
     def __ne__(self, other):
         return not (self == other)
 
+    def __hash__(self) -> int:
+        return hash((self.scriptpubkey, self.value))
+
     def to_json(self):
         d = {
             'scriptpubkey': self.scriptpubkey.hex(),
@@ -333,9 +336,9 @@ class TxInput:
         self.witness = witness
         self._is_coinbase_output = is_coinbase_output
         # blockchain fields
-        self.block_height = None  # type: Optional[int]  # height at which the TXO is mined; None means unknown. not SPV-ed.
+        self.block_height = None  # type: Optional[int]  # height at which the TXO is mined; None means unknown. SPV-ed.
         self.block_txpos = None  # type: Optional[int]  # position of tx in block, if TXO is mined; otherwise None or -1
-        self.spent_height = None  # type: Optional[int]  # height at which the TXO got spent
+        self.spent_height = None  # type: Optional[int]  # height at which the TXO got spent.  SPV-ed.
         self.spent_txid = None  # type: Optional[str]  # txid of the spender
         self._utxo = None  # type: Optional[Transaction]
         self.__scriptpubkey = None  # type: Optional[bytes]
@@ -703,7 +706,7 @@ def script_GetOp(_bytes : bytes):
 
 
 class OPPushDataGeneric:
-    def __init__(self, pushlen: Callable=None):
+    def __init__(self, pushlen: Callable[[int], bool] | None = None):
         if pushlen is not None:
             self.check_data_len = pushlen
 
@@ -721,7 +724,7 @@ class OPPushDataGeneric:
 
 
 class OPGeneric:
-    def __init__(self, matcher: Callable = None):
+    def __init__(self, matcher: Callable[[Any], bool] | None = None):
         if matcher is not None:
             self.matcher = matcher
 
@@ -729,7 +732,7 @@ class OPGeneric:
         return self.matcher(op)
 
     @classmethod
-    def is_instance(cls, item):
+    def is_instance(cls, item) -> bool:
         # accept objects that are instances of this class
         # or other classes that are subclasses
         return isinstance(item, cls) \
@@ -1432,30 +1435,6 @@ class Transaction:
     def get_output_idxs_from_address(self, addr: str) -> Set[int]:
         script = bitcoin.address_to_script(addr)
         return self.get_output_idxs_from_scriptpubkey(script)
-
-    def replace_output_address(self, old_address: str, new_address: str) -> None:
-        idx = list(self.get_output_idxs_from_address(old_address))
-        assert len(idx) == 1
-        amount = self._outputs[idx[0]].value
-        funding_output = PartialTxOutput.from_address_and_value(new_address, amount)
-        old_output = PartialTxOutput.from_address_and_value(old_address, amount)
-        self._outputs.remove(old_output)
-        self.add_outputs([funding_output])
-        delattr(self, '_script_to_output_idx')
-
-    def get_change_outputs(self):
-        return  [o for o in self._outputs if o.is_change]
-
-    def has_change(self):
-        return len(self.get_change_outputs()) > 0
-
-    def get_dummy_output(self, dummy_addr: str) -> Optional['PartialTxOutput']:
-        idxs = self.get_output_idxs_from_address(dummy_addr)
-        if not idxs:
-            return
-        assert len(idxs) == 1
-        for i in idxs:
-            return self.outputs()[i]
 
     def output_value_for_address(self, addr):
         # assumes exactly one output has that address
@@ -2430,6 +2409,30 @@ class PartialTransaction(Transaction):
         if BIP69_sort:
             self.BIP69_sort(inputs=False)
         self.invalidate_ser_cache()
+
+    def replace_output_address(self, old_address: str, new_address: str) -> None:
+        idx = list(self.get_output_idxs_from_address(old_address))
+        assert len(idx) == 1
+        amount = self._outputs[idx[0]].value
+        funding_output = PartialTxOutput.from_address_and_value(new_address, amount)
+        old_output = PartialTxOutput.from_address_and_value(old_address, amount)
+        self._outputs.remove(old_output)
+        self.add_outputs([funding_output])
+        delattr(self, '_script_to_output_idx')
+
+    def get_change_outputs(self) -> Sequence[PartialTxOutput]:
+        return [o for o in self._outputs if o.is_change]
+
+    def has_change(self) -> bool:
+        return len(self.get_change_outputs()) > 0
+
+    def get_dummy_output(self, dummy_addr: str) -> Optional['PartialTxOutput']:
+        idxs = self.get_output_idxs_from_address(dummy_addr)
+        if not idxs:
+            return None
+        assert len(idxs) == 1
+        idx = list(idxs)[0]
+        return self.outputs()[idx]
 
     def set_rbf(self, rbf: bool) -> None:
         nSequence = 0xffffffff - (2 if rbf else 1)

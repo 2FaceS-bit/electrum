@@ -38,7 +38,7 @@ class QEWalletListModel(QAbstractListModel):
     _ROLE_KEYS = range(Qt.ItemDataRole.UserRole, Qt.ItemDataRole.UserRole + len(_ROLE_NAMES))
     _ROLE_MAP  = dict(zip(_ROLE_KEYS, [bytearray(x.encode()) for x in _ROLE_NAMES]))
 
-    def __init__(self, daemon, parent=None):
+    def __init__(self, daemon: 'Daemon', parent=None):
         QAbstractListModel.__init__(self, parent)
         self.daemon = daemon
         self._wallets = []
@@ -201,7 +201,7 @@ class QEDaemon(AuthMixin, QObject):
 
         wallet_already_open = self.daemon.get_wallet(self._path)
         if wallet_already_open is not None:
-            wallet_already_open_password = QEWallet.getInstanceFor(wallet_already_open).password
+            password = QEWallet.getInstanceFor(wallet_already_open).password
 
         def load_wallet_task():
             success = False
@@ -209,7 +209,13 @@ class QEDaemon(AuthMixin, QObject):
                 local_password = password  # need this in local scope
                 wallet = None
                 try:
-                    wallet = self.daemon.load_wallet(self._path, local_password, upgrade=True)
+                    wallet = self.daemon.load_wallet(
+                        self._path,
+                        password=local_password,
+                        upgrade=True,
+                        # might have a keystore password, but unencrypted storage. we want to prompt for pw even then:
+                        force_check_password=True,
+                    )
                 except InvalidPassword:
                     self.walletRequiresPassword.emit(self._name, self._path)
                 except FileNotFoundError:
@@ -223,11 +229,6 @@ class QEDaemon(AuthMixin, QObject):
 
                 if wallet is None:
                     return
-
-                if wallet_already_open is not None:
-                    # wallet already open. daemon.load_wallet doesn't mind, but
-                    # we need the correct current wallet password below
-                    local_password = wallet_already_open_password
 
                 if self.daemon.config.WALLET_USE_SINGLE_PASSWORD:
                     self._use_single_password = self.daemon.update_password_for_directory(old_password=local_password, new_password=local_password)

@@ -5,6 +5,7 @@ import threading
 import tempfile
 import shutil
 import functools
+import inspect
 
 import electrum
 import electrum.logging
@@ -75,6 +76,7 @@ class ElectrumTestCase(unittest.IsolatedAsyncioTestCase, Logger):
         util._asyncio_event_loop = loop
 
     def tearDown(self):
+        util.callback_mgr.clear_all_callbacks()
         shutil.rmtree(self.electrum_path)
         super().tearDown()
         util._asyncio_event_loop = None  # cleared here, at the ~last possible moment. asyncTearDown is too early.
@@ -87,7 +89,7 @@ def as_testnet(func):
     NOTE: this is inherently sequential; tests running in parallel would break things
     """
     old_net = constants.net
-    if asyncio.iscoroutinefunction(func):
+    if inspect.iscoroutinefunction(func):
         async def run_test(*args, **kwargs):
             try:
                 constants.BitcoinTestnet.set_as_network()

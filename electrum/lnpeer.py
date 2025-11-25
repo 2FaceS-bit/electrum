@@ -12,6 +12,8 @@ import time
 from typing import Tuple, Dict, TYPE_CHECKING, Optional, Union, Set, Callable, Awaitable, List
 from datetime import datetime
 import functools
+from functools import partial
+import inspect
 
 import electrum_ecc as ecc
 from electrum_ecc import ecdsa_sig64_from_r_and_s, ecdsa_der_sig_from_ecdsa_sig64, ECPubkey
@@ -22,7 +24,7 @@ from aiorpcx import ignore_after
 from .crypto import sha256, sha256d, privkey_to_pubkey
 from . import bitcoin, util
 from . import constants
-from .util import (bfh, log_exceptions, ignore_exceptions, chunks, OldTaskGroup,
+from .util import (log_exceptions, ignore_exceptions, chunks, OldTaskGroup,
                    UnrelatedTransactionException, error_text_bytes_to_safe_str, AsyncHangDetector,
                    NoDynamicFeeEstimates, event_listener, EventListener)
 from . import transaction
@@ -34,7 +36,7 @@ from .lnonion import (new_onion_packet, OnionFailureCode, calc_hops_data_for_pay
                       OnionPacket, construct_onion_error, obfuscate_onion_error, OnionRoutingFailure,
                       ProcessedOnionPacket, UnsupportedOnionPacketVersion, InvalidOnionMac, InvalidOnionPubkey,
                       OnionFailureCodeMetaFlag)
-from .lnchannel import Channel, RevokeAndAck, RemoteCtnTooFarInFuture, ChannelState, PeerState, ChanCloseOption, CF_ANNOUNCE_CHANNEL
+from .lnchannel import Channel, RevokeAndAck, ChannelState, PeerState, ChanCloseOption, CF_ANNOUNCE_CHANNEL
 from . import lnutil
 from .lnutil import (Outpoint, LocalConfig, RECEIVED, UpdateAddHtlc, ChannelConfig,
                      RemoteConfig, OnlyPubkeyKeypair, ChannelConstraints, RevocationStore,
@@ -43,19 +45,17 @@ from .lnutil import (Outpoint, LocalConfig, RECEIVED, UpdateAddHtlc, ChannelConf
                      LOCAL, REMOTE, HTLCOwner,
                      ln_compare_features, MIN_FINAL_CLTV_DELTA_ACCEPTED,
                      RemoteMisbehaving, ShortChannelID,
-                     IncompatibleLightningFeatures, derive_payment_secret_from_payment_preimage,
-                     ChannelType, LNProtocolWarning, validate_features,
+                     IncompatibleLightningFeatures, ChannelType, LNProtocolWarning, validate_features,
                      IncompatibleOrInsaneFeatures, FeeBudgetExceeded,
-                     GossipForwardingMessage, GossipTimestampFilter)
-from .lnutil import FeeUpdate, channel_id_from_funding_tx, PaymentFeeBudget
-from .lnutil import serialize_htlc_key, Keypair
+                     GossipForwardingMessage, GossipTimestampFilter, channel_id_from_funding_tx,
+                     PaymentFeeBudget, serialize_htlc_key, Keypair, RecvMPPResolution)
 from .lntransport import LNTransport, LNTransportBase, LightningPeerConnectionClosed, HandshakeFailed
 from .lnmsg import encode_msg, decode_msg, UnknownOptionalMsgType, FailedToParseMsg
 from .interface import GracefulDisconnect
 from .lnrouter import fee_for_edge_msat
 from .json_db import StoredDict
 from .invoices import PR_PAID
-from .fee_policy import FEE_LN_ETA_TARGET, FEE_LN_MINIMUM_ETA_TARGET, FEERATE_PER_KW_MIN_RELAY_LIGHTNING
+from .fee_policy import FEE_LN_ETA_TARGET, FEERATE_PER_KW_MIN_RELAY_LIGHTNING
 from .trampoline import decode_routing_info
 
 if TYPE_CHECKING:
@@ -78,6 +78,8 @@ class Peer(Logger, EventListener):
         'query_short_channel_ids', 'reply_short_channel_ids', 'reply_short_channel_ids_end')
 
     DELAY_INC_MSG_PROCESSING_SLEEP = 0.01
+    RECV_GOSSIP_QUEUE_SOFT_MAXSIZE = 2000
+    RECV_GOSSIP_QUEUE_HARD_MAXSIZE = 5000
 
     def __init__(
             self,
@@ -104,12 +106,13 @@ class Peer(Logger, EventListener):
         assert self.node_ids[0] != self.node_ids[1]
         self.last_message_time = 0
         self.pong_event = asyncio.Event()
-        self.reply_channel_range = asyncio.Queue()
+        self.reply_channel_range = None  # type: Optional[asyncio.Queue]
         # gossip uses a single queue to preserve message order
-        self.gossip_queue = asyncio.Queue()
-        self.gossip_timestamp_filter = None  # type: Optional[GossipTimestampFilter]
+        self.recv_gossip_queue = asyncio.Queue(maxsize=self.RECV_GOSSIP_QUEUE_HARD_MAXSIZE)
+        self.our_gossip_timestamp_filter = None  # type: Optional[GossipTimestampFilter]
+        self.their_gossip_timestamp_filter = None  # type: Optional[GossipTimestampFilter]
         self.outgoing_gossip_reply = False # type: bool
-        self.ordered_message_queues = defaultdict(asyncio.Queue)  # type: Dict[bytes, asyncio.Queue] # for messages that are ordered
+        self.ordered_message_queues = defaultdict(partial(asyncio.Queue, maxsize=10))  # type: Dict[bytes, asyncio.Queue] # for messages that are ordered
         self.temp_id_to_id = {}  # type: Dict[bytes, Optional[bytes]]   # to forward error messages
         self.funding_created_sent = set() # for channels in PREOPENING
         self.funding_signed_sent = set()  # for channels in PREOPENING
@@ -225,6 +228,12 @@ class Peer(Logger, EventListener):
             return
         if message_type in self.ORDERED_MESSAGES:
             chan_id = payload.get('channel_id') or payload["temporary_channel_id"]
+            if (
+                chan_id not in self.channels
+                and chan_id not in self.temp_id_to_id
+                and chan_id not in self.temp_id_to_id.values()
+            ):
+                raise Exception(f"received {message_type} for unknown {chan_id.hex()=}")
             self.ordered_message_queues[chan_id].put_nowait((message_type, payload))
         else:
             if message_type not in ('error', 'warning') and 'channel_id' in payload:
@@ -246,7 +255,7 @@ class Peer(Logger, EventListener):
                 payload['sender_node_id'] = self.pubkey
             # note: the message handler might be async or non-async. In either case, by default,
             #       we wait for it to complete before we return, i.e. before the next message is processed.
-            if asyncio.iscoroutinefunction(f):
+            if inspect.iscoroutinefunction(f):
                 async with AsyncHangDetector(
                     message=f"message handler still running for {message_type.upper()}",
                     logger=self.logger,
@@ -259,7 +268,7 @@ class Peer(Logger, EventListener):
         """Makes a message handler non-blocking: while processing the message,
         the message_loop keeps processing subsequent incoming messages asynchronously.
         """
-        assert asyncio.iscoroutinefunction(func), 'func needs to be a coroutine'
+        assert inspect.iscoroutinefunction(func), 'func needs to be a coroutine'
         @functools.wraps(func)
         async def wrapper(self: 'Peer', *args, **kwargs):
             return await self.taskgroup.spawn(func(self, *args, **kwargs))
@@ -399,17 +408,26 @@ class Peer(Logger, EventListener):
         self.maybe_set_initialized()
 
     def on_node_announcement(self, payload):
-        if not self.lnworker.uses_trampoline():
-            self.gossip_queue.put_nowait(('node_announcement', payload))
+        if self.lnworker.uses_trampoline():
+            return
+        if self.our_gossip_timestamp_filter is None:
+            return  # why is the peer sending this? should we disconnect?
+        self.recv_gossip_queue.put_nowait(('node_announcement', payload))
 
     def on_channel_announcement(self, payload):
-        if not self.lnworker.uses_trampoline():
-            self.gossip_queue.put_nowait(('channel_announcement', payload))
+        if self.lnworker.uses_trampoline():
+            return
+        if self.our_gossip_timestamp_filter is None:
+            return  # why is the peer sending this? should we disconnect?
+        self.recv_gossip_queue.put_nowait(('channel_announcement', payload))
 
     def on_channel_update(self, payload):
         self.maybe_save_remote_update(payload)
-        if not self.lnworker.uses_trampoline():
-            self.gossip_queue.put_nowait(('channel_update', payload))
+        if self.lnworker.uses_trampoline():
+            return
+        if self.our_gossip_timestamp_filter is None:
+            return  # why is the peer sending this? should we disconnect?
+        self.recv_gossip_queue.put_nowait(('channel_update', payload))
 
     def on_query_channel_range(self, payload):
         if self.lnworker == self.lnworker.network.lngossip or not self._should_forward_gossip():
@@ -419,7 +437,7 @@ class Peer(Logger, EventListener):
         if self.outgoing_gossip_reply:
             return self.send_warning(bytes(32), "received multiple queries at the same time")
         self.outgoing_gossip_reply = True
-        self.gossip_queue.put_nowait(('query_channel_range', payload))
+        self.recv_gossip_queue.put_nowait(('query_channel_range', payload))
 
     def on_query_short_channel_ids(self, payload):
         if self.lnworker == self.lnworker.network.lngossip or not self._should_forward_gossip():
@@ -429,7 +447,7 @@ class Peer(Logger, EventListener):
         if not self._is_valid_short_channel_id_query(payload):
             return self.send_warning(bytes(32), "invalid query_short_channel_ids")
         self.outgoing_gossip_reply = True
-        self.gossip_queue.put_nowait(('query_short_channel_ids', payload))
+        self.recv_gossip_queue.put_nowait(('query_short_channel_ids', payload))
 
     def on_gossip_timestamp_filter(self, payload):
         if self._should_forward_gossip():
@@ -441,11 +459,11 @@ class Peer(Logger, EventListener):
         if payload.get('chain_hash') != constants.net.rev_genesis_bytes():
             return
         filter = GossipTimestampFilter.from_payload(payload)
-        self.gossip_timestamp_filter = filter
+        self.their_gossip_timestamp_filter = filter
         self.logger.debug(f"got gossip_ts_filter from peer {self.pubkey.hex()}: "
-                          f"{str(self.gossip_timestamp_filter)}")
+                          f"{str(self.their_gossip_timestamp_filter)}")
         if filter and not filter.only_forwarding:
-            self.gossip_queue.put_nowait(('gossip_timestamp_filter', None))
+            self.recv_gossip_queue.put_nowait(('gossip_timestamp_filter', None))
 
     def maybe_save_remote_update(self, payload):
         if not self.channels:
@@ -505,12 +523,17 @@ class Peer(Logger, EventListener):
     @handle_disconnect
     async def main_loop(self):
         async with self.taskgroup as group:
-            await group.spawn(self.htlc_switch())
-            await group.spawn(self._message_loop())
+            await group.spawn(self._message_loop())  # initializes connection
+            try:
+                await util.wait_for2(self.initialized, LN_P2P_NETWORK_TIMEOUT)
+            except Exception as e:
+                raise GracefulDisconnect(f"Failed to initialize: {e!r}") from e
             await group.spawn(self._query_gossip())
             await group.spawn(self._process_gossip())
             await group.spawn(self._send_own_gossip())
             await group.spawn(self._forward_gossip())
+            if self.network.lngossip != self.lnworker:
+                await group.spawn(self.htlc_switch())
 
     async def _process_gossip(self):
         while True:
@@ -521,7 +544,7 @@ class Peer(Logger, EventListener):
             chan_upds = []
             node_anns = []
             while True:
-                name, payload = await self.gossip_queue.get()
+                name, payload = await self.recv_gossip_queue.get()
                 if name == 'channel_announcement':
                     chan_anns.append(payload)
                 elif name == 'channel_update':
@@ -536,7 +559,7 @@ class Peer(Logger, EventListener):
                     await self.taskgroup.spawn(self._handle_historical_gossip_request())
                 else:
                     raise Exception('unknown message')
-                if self.gossip_queue.empty():
+                if self.recv_gossip_queue.empty():
                     break
             if self.network.lngossip:
                 await self.network.lngossip.process_gossip(chan_anns, node_anns, chan_upds)
@@ -544,6 +567,7 @@ class Peer(Logger, EventListener):
     async def _send_own_gossip(self):
         if self.lnworker == self.lnworker.network.lngossip:
             return
+        assert self.is_initialized()
         await asyncio.sleep(10)
         while True:
             public_channels = [chan for chan in self.lnworker.channels.values() if chan.is_public()]
@@ -564,6 +588,7 @@ class Peer(Logger, EventListener):
         return False
 
     async def _forward_gossip(self):
+        assert self.is_initialized()
         if not self._should_forward_gossip():
             return
 
@@ -577,7 +602,7 @@ class Peer(Logger, EventListener):
         last_gossip_batch_ts = 0
         while True:
             await asyncio.sleep(10)
-            if not self.gossip_timestamp_filter:
+            if not self.their_gossip_timestamp_filter:
                 continue  # peer didn't request gossip
 
             new_gossip, last_lngossip_refresh_ts = await lngossip.get_forwarding_gossip()
@@ -589,7 +614,7 @@ class Peer(Logger, EventListener):
 
     async def _handle_historical_gossip_request(self):
         """Called when a peer requests historical gossip with a gossip_timestamp_filter query."""
-        filter = self.gossip_timestamp_filter
+        filter = self.their_gossip_timestamp_filter
         if not self._should_forward_gossip() or not filter or filter.only_forwarding:
             return
         async with self.network.lngossip.gossip_request_semaphore:
@@ -603,7 +628,7 @@ class Peer(Logger, EventListener):
     async def _send_gossip_messages(self, messages: List[GossipForwardingMessage]) -> int:
         amount_sent = 0
         for msg in messages:
-            if self.gossip_timestamp_filter.in_range(msg.timestamp) \
+            if self.their_gossip_timestamp_filter.in_range(msg.timestamp) \
                 and self.pubkey != msg.sender_node_id:
                 await self.transport.send_bytes_and_drain(msg.msg)
                 amount_sent += 1
@@ -613,10 +638,7 @@ class Peer(Logger, EventListener):
         return amount_sent
 
     async def _query_gossip(self):
-        try:
-            await util.wait_for2(self.initialized, LN_P2P_NETWORK_TIMEOUT)
-        except Exception as e:
-            raise GracefulDisconnect(f"Failed to initialize: {e!r}") from e
+        assert self.is_initialized()
         if self.lnworker == self.lnworker.network.lngossip:
             if not self.their_features.supports(LnFeatures.GOSSIP_QUERIES_OPT):
                 raise GracefulDisconnect("remote does not support gossip_queries, which we need")
@@ -697,6 +719,7 @@ class Peer(Logger, EventListener):
             self.outgoing_gossip_reply = False
 
     async def get_channel_range(self):
+        self.reply_channel_range = asyncio.Queue()
         first_block = constants.net.BLOCK_HEIGHT_FIRST_LIGHTNING_CHANNELS
         num_blocks = self.lnworker.network.get_local_height() - first_block
         self.query_channel_range(first_block, num_blocks)
@@ -735,6 +758,7 @@ class Peer(Logger, EventListener):
                 a, b = intervals[0]
                 if a <= first_block and b >= first_block + num_blocks:
                     break
+        self.reply_channel_range = None
         return ids, complete
 
     def request_gossip(self, timestamp=0):
@@ -742,11 +766,17 @@ class Peer(Logger, EventListener):
             self.logger.info('requesting whole channel graph')
         else:
             self.logger.info(f'requesting channel graph since {datetime.fromtimestamp(timestamp).isoformat()}')
+        timestamp_range = 0xFFFFFFFF
+        self.our_gossip_timestamp_filter = GossipTimestampFilter(
+            first_timestamp=timestamp,
+            timestamp_range=timestamp_range,
+        )
         self.send_message(
             'gossip_timestamp_filter',
             chain_hash=constants.net.rev_genesis_bytes(),
             first_timestamp=timestamp,
-            timestamp_range=b'\xff'*4)
+            timestamp_range=timestamp_range,
+        )
 
     def query_channel_range(self, first_block, num_blocks):
         self.logger.info(f'query channel range {first_block} {num_blocks}')
@@ -766,7 +796,7 @@ class Peer(Logger, EventListener):
         ids = [decoded[i:i+8] for i in range(0, len(decoded), 8)]
         return ids
 
-    def on_reply_channel_range(self, payload):
+    async def on_reply_channel_range(self, payload):
         first = payload['first_blocknum']
         num = payload['number_of_blocks']
         complete = bool(int.from_bytes(payload['sync_complete'], 'big'))
@@ -774,6 +804,12 @@ class Peer(Logger, EventListener):
         ids = self.decode_short_ids(encoded)
         # self.logger.info(f"on_reply_channel_range. >>> first_block {first}, num_blocks {num}, "
         #                  f"num_ids {len(ids)}, complete {complete}")
+        if self.reply_channel_range is None:
+            raise Exception("received 'reply_channel_range' without corresponding 'query_channel_range'")
+        while self.reply_channel_range.qsize() > 10:
+            # we block process_message until the queue gets consumed
+            self.logger.info("reply_channel_range queue is overflowing. sleeping...")
+            await asyncio.sleep(0.1)
         self.reply_channel_range.put_nowait((first, num, complete, ids))
 
     async def _send_reply_short_channel_ids(self, payload: dict):
@@ -830,6 +866,15 @@ class Peer(Logger, EventListener):
                 # rate-limit message-processing a bit, to make it harder
                 # for a single peer to bog down the event loop / cpu:
                 await asyncio.sleep(self.DELAY_INC_MSG_PROCESSING_SLEEP)
+            # If receiving too much gossip from this peer, we need to slow them down.
+            # note: if the gossip queue gets full, we will disconnect from them
+            #       and throw away unprocessed gossip.
+            if self.recv_gossip_queue.qsize() > self.RECV_GOSSIP_QUEUE_SOFT_MAXSIZE:
+                sleep = self.recv_gossip_queue.qsize() / 1000
+                self.logger.debug(
+                    f"message_loop sleeping due to getting much gossip. qsize={self.recv_gossip_queue.qsize()}. "
+                    f"waiting for existing gossip data to be processed first.")
+                await asyncio.sleep(sleep)
 
     def on_reply_short_channel_ids_end(self, payload):
         self.querying.set()
@@ -1050,8 +1095,8 @@ class Peer(Logger, EventListener):
             int.from_bytes(per_commitment_secret_first, 'big'))
 
         # store the temp id now, so that it is recognized for e.g. 'error' messages
-        # TODO: this is never cleaned up; the dict grows unbounded until disconnect
         self.temp_id_to_id[temp_channel_id] = None
+        self._cleanup_temp_channelids()
         self.send_message(
             "open_channel",
             temporary_channel_id=temp_channel_id,
@@ -1218,8 +1263,7 @@ class Peer(Logger, EventListener):
             "revocation_store": {},
             "channel_type": channel_type,
         }
-        # set db to None, because we do not want to write updates until channel is saved
-        return StoredDict(chan_dict, None, [])
+        return StoredDict(chan_dict, self.lnworker.db)
 
     @non_blocking_msg_handler
     async def on_open_channel(self, payload):
@@ -1270,8 +1314,8 @@ class Peer(Logger, EventListener):
         feerate = payload['feerate_per_kw']  # note: we are not validating this
         temp_chan_id = payload['temporary_channel_id']
         # store the temp id now, so that it is recognized for e.g. 'error' messages
-        # TODO: this is never cleaned up; the dict grows unbounded until disconnect
         self.temp_id_to_id[temp_chan_id] = None
+        self._cleanup_temp_channelids()
         channel_opening_fee = open_channel_tlvs.get('channel_opening_fee') if open_channel_tlvs else None
         if channel_opening_fee:
             # todo check that the fee is reasonable
@@ -1412,6 +1456,15 @@ class Peer(Logger, EventListener):
             chan.set_state(ChannelState.FUNDED)
             self.send_channel_ready(chan)
         self.lnworker.add_new_channel(chan)
+
+    def _cleanup_temp_channelids(self) -> None:
+        self.temp_id_to_id = {
+            tmp_id: chan_id for (tmp_id, chan_id) in self.temp_id_to_id.items()
+            if chan_id not in self.channels
+        }
+        if len(self.temp_id_to_id) > 25:
+            # which one of us is opening all these chans?! let's disconnect
+            raise Exception("temp_id_to_id is getting too large.")
 
     async def request_force_close(self, channel_id: bytes):
         """Try to trigger the remote peer to force-close."""
@@ -1875,57 +1928,6 @@ class Peer(Logger, EventListener):
         self.send_message("commitment_signed", channel_id=chan.channel_id, signature=sig_64, num_htlcs=len(htlc_sigs), htlc_signature=b"".join(htlc_sigs))
         return True
 
-    def create_onion_for_route(
-            self, *,
-            route: 'LNPaymentRoute',
-            amount_msat: int,
-            total_msat: int,
-            payment_hash: bytes,
-            min_final_cltv_delta: int,
-            payment_secret: bytes,
-            trampoline_onion: Optional[OnionPacket] = None,
-    ):
-        # add features learned during "init" for direct neighbour:
-        route[0].node_features |= self.features
-        local_height = self.network.get_local_height()
-        final_cltv_abs = local_height + min_final_cltv_delta
-        hops_data, amount_msat, cltv_abs = calc_hops_data_for_payment(
-            route,
-            amount_msat,
-            final_cltv_abs=final_cltv_abs,
-            total_msat=total_msat,
-            payment_secret=payment_secret)
-        num_hops = len(hops_data)
-        self.logger.info(f"lnpeer.pay len(route)={len(route)}")
-        for i in range(len(route)):
-            self.logger.info(f"  {i}: edge={route[i].short_channel_id} hop_data={hops_data[i]!r}")
-        assert final_cltv_abs <= cltv_abs, (final_cltv_abs, cltv_abs)
-        session_key = os.urandom(32) # session_key
-        # if we are forwarding a trampoline payment, add trampoline onion
-        if trampoline_onion:
-            self.logger.info(f'adding trampoline onion to final payload')
-            trampoline_payload = hops_data[-1].payload
-            trampoline_payload["trampoline_onion_packet"] = {
-                "version": trampoline_onion.version,
-                "public_key": trampoline_onion.public_key,
-                "hops_data": trampoline_onion.hops_data,
-                "hmac": trampoline_onion.hmac
-            }
-            if t_hops_data := trampoline_onion._debug_hops_data:  # None if trampoline-forwarding
-                t_route = trampoline_onion._debug_route
-                assert t_route is not None
-                self.logger.info(f"lnpeer.pay len(t_route)={len(t_route)}")
-                for i in range(len(t_route)):
-                    self.logger.info(f"  {i}: t_node={t_route[i].end_node.hex()} hop_data={t_hops_data[i]!r}")
-        # create onion packet
-        payment_path_pubkeys = [x.node_id for x in route]
-        onion = new_onion_packet(payment_path_pubkeys, session_key, hops_data, associated_data=payment_hash) # must use another sessionkey
-        self.logger.info(f"starting payment. len(route)={len(hops_data)}.")
-        # create htlc
-        if cltv_abs > local_height + lnutil.NBLOCK_CLTV_DELTA_TOO_FAR_INTO_FUTURE:
-            raise PaymentFailure(f"htlc expiry too far into future. (in {cltv_abs-local_height} blocks)")
-        return onion, amount_msat, cltv_abs, session_key
-
     def send_htlc(
         self,
         *,
@@ -1968,7 +1970,7 @@ class Peer(Logger, EventListener):
         assert len(route) > 0
         if not chan.can_send_update_add_htlc():
             raise PaymentFailure("Channel cannot send update_add_htlc")
-        onion, amount_msat, cltv_abs, session_key = self.create_onion_for_route(
+        onion, amount_msat, cltv_abs, session_key = self.lnworker.create_onion_for_route(
             route=route,
             amount_msat=amount_msat,
             total_msat=total_msat,
@@ -2080,280 +2082,13 @@ class Peer(Logger, EventListener):
         chan.receive_htlc(htlc, onion_packet)
         util.trigger_callback('htlc_added', chan, htlc, RECEIVED)
 
-
-    async def maybe_forward_htlc(
-            self, *,
-            incoming_chan: Channel,
-            htlc: UpdateAddHtlc,
-            processed_onion: ProcessedOnionPacket,
-    ) -> str:
-
-        # Forward HTLC
-        # FIXME: there are critical safety checks MISSING here
-        #        - for example; atm we forward first and then persist "forwarding_info",
-        #          so if we segfault in-between and restart, we might forward an HTLC twice...
-        #          (same for trampoline forwarding)
-        #        - we could check for the exposure to dust HTLCs, see:
-        #          https://github.com/ACINQ/eclair/pull/1985
-
-        def log_fail_reason(reason: str):
-            self.logger.debug(
-                f"maybe_forward_htlc. will FAIL HTLC: inc_chan={incoming_chan.get_id_for_log()}. "
-                f"{reason}. inc_htlc={str(htlc)}. onion_payload={processed_onion.hop_data.payload}")
-
-        forwarding_enabled = self.network.config.EXPERIMENTAL_LN_FORWARD_PAYMENTS
-        if not forwarding_enabled:
-            log_fail_reason("forwarding is disabled")
-            raise OnionRoutingFailure(code=OnionFailureCode.PERMANENT_CHANNEL_FAILURE, data=b'')
-        chain = self.network.blockchain()
-        if chain.is_tip_stale():
-            raise OnionRoutingFailure(code=OnionFailureCode.TEMPORARY_NODE_FAILURE, data=b'')
-        try:
-            _next_chan_scid = processed_onion.hop_data.payload["short_channel_id"]["short_channel_id"]  # type: bytes
-            next_chan_scid = ShortChannelID(_next_chan_scid)
-        except Exception:
-            raise OnionRoutingFailure(code=OnionFailureCode.INVALID_ONION_PAYLOAD, data=b'\x00\x00\x00')
-        try:
-            next_amount_msat_htlc = processed_onion.hop_data.payload["amt_to_forward"]["amt_to_forward"]
-        except Exception:
-            raise OnionRoutingFailure(code=OnionFailureCode.INVALID_ONION_PAYLOAD, data=b'\x00\x00\x00')
-        try:
-            next_cltv_abs = processed_onion.hop_data.payload["outgoing_cltv_value"]["outgoing_cltv_value"]
-        except Exception:
-            raise OnionRoutingFailure(code=OnionFailureCode.INVALID_ONION_PAYLOAD, data=b'\x00\x00\x00')
-
-        next_chan = self.lnworker.get_channel_by_short_id(next_chan_scid)
-
-        if self.lnworker.features.supports(LnFeatures.OPTION_ZEROCONF_OPT):
-            next_peer = self.lnworker.get_peer_by_static_jit_scid_alias(next_chan_scid)
-        else:
-            next_peer = None
-
-        if not next_chan and next_peer and next_peer.accepts_zeroconf():
-            # check if an already existing channel can be used.
-            # todo: split the payment
-            for next_chan in next_peer.channels.values():
-                if next_chan.can_pay(next_amount_msat_htlc):
-                    break
-            else:
-                return await self.lnworker.open_channel_just_in_time(
-                    next_peer=next_peer,
-                    next_amount_msat_htlc=next_amount_msat_htlc,
-                    next_cltv_abs=next_cltv_abs,
-                    payment_hash=htlc.payment_hash,
-                    next_onion=processed_onion.next_packet)
-
-        local_height = chain.height()
-        if next_chan is None:
-            log_fail_reason(f"cannot find next_chan {next_chan_scid}")
-            raise OnionRoutingFailure(code=OnionFailureCode.UNKNOWN_NEXT_PEER, data=b'')
-        outgoing_chan_upd = next_chan.get_outgoing_gossip_channel_update(scid=next_chan_scid)[2:]
-        outgoing_chan_upd_len = len(outgoing_chan_upd).to_bytes(2, byteorder="big")
-        outgoing_chan_upd_message = outgoing_chan_upd_len + outgoing_chan_upd
-        if not next_chan.can_send_update_add_htlc():
-            log_fail_reason(
-                f"next_chan {next_chan.get_id_for_log()} cannot send ctx updates. "
-                f"chan state {next_chan.get_state()!r}, peer state: {next_chan.peer_state!r}")
-            raise OnionRoutingFailure(code=OnionFailureCode.TEMPORARY_CHANNEL_FAILURE, data=outgoing_chan_upd_message)
-        if not next_chan.can_pay(next_amount_msat_htlc):
-            log_fail_reason(f"transient error (likely due to insufficient funds): not next_chan.can_pay(amt)")
-            raise OnionRoutingFailure(code=OnionFailureCode.TEMPORARY_CHANNEL_FAILURE, data=outgoing_chan_upd_message)
-        if htlc.cltv_abs - next_cltv_abs < next_chan.forwarding_cltv_delta:
-            log_fail_reason(
-                f"INCORRECT_CLTV_EXPIRY. "
-                f"{htlc.cltv_abs=} - {next_cltv_abs=} < {next_chan.forwarding_cltv_delta=}")
-            data = htlc.cltv_abs.to_bytes(4, byteorder="big") + outgoing_chan_upd_message
-            raise OnionRoutingFailure(code=OnionFailureCode.INCORRECT_CLTV_EXPIRY, data=data)
-        if htlc.cltv_abs - lnutil.MIN_FINAL_CLTV_DELTA_ACCEPTED <= local_height \
-                or next_cltv_abs <= local_height:
-            raise OnionRoutingFailure(code=OnionFailureCode.EXPIRY_TOO_SOON, data=outgoing_chan_upd_message)
-        if max(htlc.cltv_abs, next_cltv_abs) > local_height + lnutil.NBLOCK_CLTV_DELTA_TOO_FAR_INTO_FUTURE:
-            raise OnionRoutingFailure(code=OnionFailureCode.EXPIRY_TOO_FAR, data=b'')
-        forwarding_fees = fee_for_edge_msat(
-            forwarded_amount_msat=next_amount_msat_htlc,
-            fee_base_msat=next_chan.forwarding_fee_base_msat,
-            fee_proportional_millionths=next_chan.forwarding_fee_proportional_millionths)
-        if htlc.amount_msat - next_amount_msat_htlc < forwarding_fees:
-            data = next_amount_msat_htlc.to_bytes(8, byteorder="big") + outgoing_chan_upd_message
-            raise OnionRoutingFailure(code=OnionFailureCode.FEE_INSUFFICIENT, data=data)
-        if self._maybe_refuse_to_forward_htlc_that_corresponds_to_payreq_we_created(htlc.payment_hash):
-            log_fail_reason(f"RHASH corresponds to payreq we created")
-            raise OnionRoutingFailure(code=OnionFailureCode.TEMPORARY_NODE_FAILURE, data=b'')
-        self.logger.info(
-            f"maybe_forward_htlc. will forward HTLC: inc_chan={incoming_chan.short_channel_id}. inc_htlc={str(htlc)}. "
-            f"next_chan={next_chan.get_id_for_log()}.")
-
-        next_peer = self.lnworker.peers.get(next_chan.node_id)
-        if next_peer is None:
-            log_fail_reason(f"next_peer offline ({next_chan.node_id.hex()})")
-            raise OnionRoutingFailure(code=OnionFailureCode.TEMPORARY_CHANNEL_FAILURE, data=outgoing_chan_upd_message)
-        try:
-            next_htlc = next_peer.send_htlc(
-                chan=next_chan,
-                payment_hash=htlc.payment_hash,
-                amount_msat=next_amount_msat_htlc,
-                cltv_abs=next_cltv_abs,
-                onion=processed_onion.next_packet,
-            )
-        except BaseException as e:
-            log_fail_reason(f"error sending message to next_peer={next_chan.node_id.hex()}")
-            raise OnionRoutingFailure(code=OnionFailureCode.TEMPORARY_CHANNEL_FAILURE, data=outgoing_chan_upd_message)
-
-        htlc_key = serialize_htlc_key(next_chan.get_scid_or_local_alias(), next_htlc.htlc_id)
-        return htlc_key
-
-    @log_exceptions
-    async def maybe_forward_trampoline(
-            self, *,
-            payment_hash: bytes,
-            inc_cltv_abs: int,
-            outer_onion: ProcessedOnionPacket,
-            trampoline_onion: ProcessedOnionPacket,
-            fw_payment_key: str,
-    ) -> None:
-
-        forwarding_enabled = self.network.config.EXPERIMENTAL_LN_FORWARD_PAYMENTS
-        forwarding_trampoline_enabled = self.network.config.EXPERIMENTAL_LN_FORWARD_TRAMPOLINE_PAYMENTS
-        if not (forwarding_enabled and forwarding_trampoline_enabled):
-            self.logger.info(f"trampoline forwarding is disabled. failing htlc.")
-            raise OnionRoutingFailure(code=OnionFailureCode.PERMANENT_CHANNEL_FAILURE, data=b'')
-        payload = trampoline_onion.hop_data.payload
-        payment_data = payload.get('payment_data')
-        try:
-            payment_secret = payment_data['payment_secret'] if payment_data else os.urandom(32)
-            outgoing_node_id = payload["outgoing_node_id"]["outgoing_node_id"]
-            amt_to_forward = payload["amt_to_forward"]["amt_to_forward"]
-            out_cltv_abs = payload["outgoing_cltv_value"]["outgoing_cltv_value"]
-            if "invoice_features" in payload:
-                self.logger.info('forward_trampoline: legacy')
-                next_trampoline_onion = None
-                invoice_features = payload["invoice_features"]["invoice_features"]
-                invoice_routing_info = payload["invoice_routing_info"]["invoice_routing_info"]
-                r_tags = decode_routing_info(invoice_routing_info)
-                self.logger.info(f'r_tags {r_tags}')
-                # TODO legacy mpp payment, use total_msat from trampoline onion
-            else:
-                self.logger.info('forward_trampoline: end-to-end')
-                invoice_features = LnFeatures.BASIC_MPP_OPT
-                next_trampoline_onion = trampoline_onion.next_packet
-                r_tags = []
-        except Exception as e:
-            self.logger.exception('')
-            raise OnionRoutingFailure(code=OnionFailureCode.INVALID_ONION_PAYLOAD, data=b'\x00\x00\x00')
-
-        if self._maybe_refuse_to_forward_htlc_that_corresponds_to_payreq_we_created(payment_hash):
-            self.logger.debug(
-                f"maybe_forward_trampoline. will FAIL HTLC(s). "
-                f"RHASH corresponds to payreq we created. {payment_hash.hex()=}")
-            raise OnionRoutingFailure(code=OnionFailureCode.TEMPORARY_NODE_FAILURE, data=b'')
-
-        # these are the fee/cltv paid by the sender
-        # pay_to_node will raise if they are not sufficient
-        total_msat = outer_onion.hop_data.payload["payment_data"]["total_msat"]
-        budget = PaymentFeeBudget(
-            fee_msat=total_msat - amt_to_forward,
-            cltv=inc_cltv_abs - out_cltv_abs,
-        )
-        self.logger.info(f'trampoline forwarding. budget={budget}')
-        self.logger.info(f'trampoline forwarding. {inc_cltv_abs=}, {out_cltv_abs=}')
-        # To convert abs vs rel cltvs, we need to guess blockheight used by original sender as "current blockheight".
-        # Blocks might have been mined since.
-        # - if we skew towards the past, we decrease our own cltv_budget accordingly (which is ok)
-        # - if we skew towards the future, we decrease the cltv_budget for the subsequent nodes in the path,
-        #   which can result in them failing the payment.
-        # So we skew towards the past and guess that there has been 1 new block mined since the payment began:
-        local_height_of_onion_creator = self.network.get_local_height() - 1
-        cltv_budget_for_rest_of_route = out_cltv_abs - local_height_of_onion_creator
-
-        if budget.fee_msat < 1000:
-            raise OnionRoutingFailure(code=OnionFailureCode.TRAMPOLINE_FEE_INSUFFICIENT, data=b'')
-        if budget.cltv < 576:
-            raise OnionRoutingFailure(code=OnionFailureCode.TRAMPOLINE_EXPIRY_TOO_SOON, data=b'')
-
-        # do we have a connection to the node?
-        next_peer = self.lnworker.peers.get(outgoing_node_id)
-        if next_peer and next_peer.accepts_zeroconf():
-            self.logger.info(f'JIT: found next_peer')
-            for next_chan in next_peer.channels.values():
-                if next_chan.can_pay(amt_to_forward):
-                    # todo: detect if we can do mpp
-                    self.logger.info(f'jit: next_chan can pay')
-                    break
-            else:
-                scid_alias = self.lnworker._scid_alias_of_node(next_peer.pubkey)
-                route = [RouteEdge(
-                    start_node=next_peer.pubkey,
-                    end_node=outgoing_node_id,
-                    short_channel_id=scid_alias,
-                    fee_base_msat=0,
-                    fee_proportional_millionths=0,
-                    cltv_delta=144,
-                    node_features=0
-                )]
-                next_onion, amount_msat, cltv_abs, session_key = self.create_onion_for_route(
-                    route=route,
-                    amount_msat=amt_to_forward,
-                    total_msat=amt_to_forward,
-                    payment_hash=payment_hash,
-                    min_final_cltv_delta=cltv_budget_for_rest_of_route,
-                    payment_secret=payment_secret,
-                    trampoline_onion=next_trampoline_onion,
-                )
-                await self.lnworker.open_channel_just_in_time(
-                    next_peer=next_peer,
-                    next_amount_msat_htlc=amt_to_forward,
-                    next_cltv_abs=cltv_abs,
-                    payment_hash=payment_hash,
-                    next_onion=next_onion)
-                return
-
-        try:
-            await self.lnworker.pay_to_node(
-                node_pubkey=outgoing_node_id,
-                payment_hash=payment_hash,
-                payment_secret=payment_secret,
-                amount_to_pay=amt_to_forward,
-                min_final_cltv_delta=cltv_budget_for_rest_of_route,
-                r_tags=r_tags,
-                invoice_features=invoice_features,
-                fwd_trampoline_onion=next_trampoline_onion,
-                budget=budget,
-                attempts=100,
-                fw_payment_key=fw_payment_key,
-            )
-        except OnionRoutingFailure as e:
-            raise
-        except FeeBudgetExceeded:
-            raise OnionRoutingFailure(code=OnionFailureCode.TRAMPOLINE_FEE_INSUFFICIENT, data=b'')
-        except PaymentFailure as e:
-            self.logger.debug(
-                f"maybe_forward_trampoline. PaymentFailure for {payment_hash.hex()=}, {payment_secret.hex()=}: {e!r}")
-            raise OnionRoutingFailure(code=OnionFailureCode.UNKNOWN_NEXT_PEER, data=b'')
-
-    def _maybe_refuse_to_forward_htlc_that_corresponds_to_payreq_we_created(self, payment_hash: bytes) -> bool:
-        """Returns True if the HTLC should be failed.
-        We must not forward HTLCs with a matching payment_hash to a payment request we created.
-        Example attack:
-        - Bob creates payment request with HASH1, for 1 BTC; and gives the payreq to Alice
-        - Alice sends htlc A->B->C, for 1 sat, with HASH1
-        - Bob must not release the preimage of HASH1
-        """
-        payment_info = self.lnworker.get_payment_info(payment_hash)
-        is_our_payreq = payment_info and payment_info.direction == RECEIVED
-        # note: If we don't have the preimage for a payment request, then it must be a hold invoice.
-        #       Hold invoices are created by other parties (e.g. a counterparty initiating a submarine swap),
-        #       and it is the other party choosing the payment_hash. If we failed HTLCs with payment_hashes colliding
-        #       with hold invoices, then a party that can make us save a hold invoice for an arbitrary hash could
-        #       also make us fail arbitrary HTLCs.
-        return bool(is_our_payreq and self.lnworker.get_preimage(payment_hash))
-
     def check_accepted_htlc(
             self, *,
             chan: Channel,
             htlc: UpdateAddHtlc,
             processed_onion: ProcessedOnionPacket,
-            log_fail_reason: Callable,
-    ):
+            log_fail_reason: Callable[[str], None],
+    ) -> tuple[bytes, int, int, OnionRoutingFailure]:
         """
         Perform checks that are invariant (results do not depend on height, network conditions, etc).
         May raise OnionRoutingFailure
@@ -2379,13 +2114,13 @@ class Peer(Logger, EventListener):
                 code=OnionFailureCode.FINAL_INCORRECT_CLTV_EXPIRY,
                 data=htlc.cltv_abs.to_bytes(4, byteorder="big"))
         try:
-            total_msat = processed_onion.hop_data.payload["payment_data"]["total_msat"]
+            total_msat = processed_onion.hop_data.payload["payment_data"]["total_msat"]  # type: int
         except Exception:
             log_fail_reason(f"'total_msat' missing from onion")
             raise exc_incorrect_or_unknown_pd
 
         if chan.opening_fee:
-            channel_opening_fee = chan.opening_fee['channel_opening_fee']
+            channel_opening_fee = chan.opening_fee['channel_opening_fee']  # type: int
             total_msat -= channel_opening_fee
             amt_to_forward -= channel_opening_fee
         else:
@@ -2405,8 +2140,16 @@ class Peer(Logger, EventListener):
 
         return payment_secret_from_onion, total_msat, channel_opening_fee, exc_incorrect_or_unknown_pd
 
-    def check_mpp_is_waiting(self, *, payment_secret, short_channel_id, htlc, expected_msat, exc_incorrect_or_unknown_pd, log_fail_reason) -> bool:
-        from .lnworker import RecvMPPResolution
+    def check_mpp_is_waiting(
+        self,
+        *,
+        payment_secret: bytes,
+        short_channel_id: ShortChannelID,
+        htlc: UpdateAddHtlc,
+        expected_msat: int,
+        exc_incorrect_or_unknown_pd: OnionRoutingFailure,
+        log_fail_reason: Callable[[str], None],
+    ) -> bool:
         mpp_resolution = self.lnworker.check_mpp_status(
             payment_secret=payment_secret,
             short_channel_id=short_channel_id,
@@ -2421,7 +2164,7 @@ class Peer(Logger, EventListener):
         elif mpp_resolution == RecvMPPResolution.FAILED:
             log_fail_reason(f"mpp_resolution is FAILED")
             raise exc_incorrect_or_unknown_pd
-        elif mpp_resolution == RecvMPPResolution.ACCEPTED:
+        elif mpp_resolution == RecvMPPResolution.COMPLETE:
             return False
         else:
             raise Exception(f"unexpected {mpp_resolution=}")
@@ -2443,7 +2186,7 @@ class Peer(Logger, EventListener):
                 return None, None
             # use the htlc key if we are forwarding
             payment_key = serialize_htlc_key(chan.get_scid_or_local_alias(), htlc.htlc_id)
-            callback = lambda: self.maybe_forward_htlc(
+            callback = lambda: self.lnworker.maybe_forward_htlc(
                 incoming_chan=chan,
                 htlc=htlc,
                 processed_onion=processed_onion)
@@ -2485,6 +2228,8 @@ class Peer(Logger, EventListener):
             return None, None
 
         # TODO check against actual min_final_cltv_expiry_delta from invoice (and give 2-3 blocks of leeway?)
+        # note: payment_bundles might get split here, e.g. one payment is "already forwarded" and the other is not.
+        #       In practice, for the swap prepayment use case, this does not matter.
         if local_height + MIN_FINAL_CLTV_DELTA_ACCEPTED > htlc.cltv_abs and not already_forwarded:
             log_fail_reason(f"htlc.cltv_abs is unreasonably close")
             raise exc_incorrect_or_unknown_pd
@@ -2511,7 +2256,7 @@ class Peer(Logger, EventListener):
                     already_forwarded=already_forwarded,
                 )
             else:
-                callback = lambda: self.maybe_forward_trampoline(
+                callback = lambda: self.lnworker.maybe_forward_trampoline(
                     payment_hash=payment_hash,
                     inc_cltv_abs=htlc.cltv_abs, # TODO: use max or enforce same value across mpp parts
                     outer_onion=processed_onion,
@@ -2520,18 +2265,18 @@ class Peer(Logger, EventListener):
                 return None, (payment_key, callback)
 
         # TODO don't accept payments twice for same invoice
-        # TODO check invoice expiry
+        # note: we don't check invoice expiry (bolt11 'x' field) on the receiver-side.
+        #       - semantics are weird: would make sense for simple-payment-receives, but not
+        #         if htlc is expected to be pending for a while, e.g. for a hold-invoice.
         info = self.lnworker.get_payment_info(payment_hash)
         if info is None:
             log_fail_reason(f"no payment_info found for RHASH {htlc.payment_hash.hex()}")
             raise exc_incorrect_or_unknown_pd
 
         preimage = self.lnworker.get_preimage(payment_hash)
-        expected_payment_secrets = [self.lnworker.get_payment_secret(htlc.payment_hash)]
-        if preimage:
-            expected_payment_secrets.append(derive_payment_secret_from_payment_preimage(preimage)) # legacy secret for old invoices
-        if payment_secret_from_onion not in expected_payment_secrets:
-            log_fail_reason(f'incorrect payment secret {payment_secret_from_onion.hex()} != {expected_payment_secrets[0].hex()}')
+        expected_payment_secret = self.lnworker.get_payment_secret(htlc.payment_hash)
+        if payment_secret_from_onion != expected_payment_secret:
+            log_fail_reason(f'incorrect payment secret {payment_secret_from_onion.hex()} != {expected_payment_secret.hex()}')
             raise exc_incorrect_or_unknown_pd
         invoice_msat = info.amount_msat
         if channel_opening_fee:
