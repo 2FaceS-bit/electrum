@@ -23,197 +23,29 @@
 # (around commit 42de4400bff5105352d0552155f73589166d162b).
 
 import unittest
+from unittest import mock
 import os
-import binascii
-from pprint import pformat
 import logging
 import dataclasses
+import time
 
 from electrum import bitcoin
-from electrum import lnpeer
 from electrum import lnchannel
 from electrum import lnutil
-from electrum import bip32 as bip32_utils
-from electrum.crypto import privkey_to_pubkey
-from electrum.lnutil import SENT, LOCAL, REMOTE, RECEIVED, UpdateAddHtlc
-from electrum.lnutil import effective_htlc_tx_weight
+from electrum.crypto import sha256
+from electrum.lnutil import (
+    SENT, LOCAL, REMOTE, RECEIVED, UpdateAddHtlc, ChannelType,
+    effective_htlc_tx_weight, ZEROCONF_TIMEOUT,
+    CHANNEL_OPENING_TIMEOUT_SEC,
+)
 from electrum.logging import console_stderr_handler
-from electrum.lnchannel import ChannelState
-from electrum.json_db import StoredDict
-from electrum.coinchooser import PRNG
+from electrum.lnchannel import ChannelState, Channel
 
 from . import ElectrumTestCase
+from .lnhelpers import create_test_channels
+
 
 one_bitcoin_in_msat = bitcoin.COIN * 1000
-
-
-def create_channel_state(funding_txid, funding_index, funding_sat, is_initiator,
-                         local_amount, remote_amount, privkeys, other_pubkeys,
-                         seed, cur, nex, other_node_id, l_dust, r_dust, l_csv,
-                         r_csv, anchor_outputs, local_max_inflight, remote_max_inflight):
-    #assert local_amount > 0
-    #assert remote_amount > 0
-
-    channel_id, _ = lnpeer.channel_id_from_funding_tx(funding_txid, funding_index)
-    channel_type = lnutil.ChannelType.OPTION_STATIC_REMOTEKEY
-    if anchor_outputs:
-        channel_type |= lnutil.ChannelType.OPTION_ANCHORS_ZERO_FEE_HTLC_TX
-    state = {
-            "channel_id":channel_id.hex(),
-            "short_channel_id":channel_id[:8],
-            "funding_outpoint":lnpeer.Outpoint(funding_txid, funding_index),
-            "remote_config":lnpeer.RemoteConfig(
-                payment_basepoint=other_pubkeys[0],
-                multisig_key=other_pubkeys[1],
-                htlc_basepoint=other_pubkeys[2],
-                delayed_basepoint=other_pubkeys[3],
-                revocation_basepoint=other_pubkeys[4],
-                to_self_delay=r_csv,
-                dust_limit_sat=r_dust,
-                max_htlc_value_in_flight_msat=remote_max_inflight,
-                max_accepted_htlcs=5,
-                initial_msat=remote_amount,
-                reserve_sat=0,
-                htlc_minimum_msat=1,
-                next_per_commitment_point=nex,
-                current_per_commitment_point=cur,
-                upfront_shutdown_script=b'',
-                announcement_node_sig=b'',
-                announcement_bitcoin_sig=b'',
-            ),
-            "local_config":lnpeer.LocalConfig(
-                channel_seed = None,
-                payment_basepoint=privkeys[0],
-                multisig_key=privkeys[1],
-                htlc_basepoint=privkeys[2],
-                delayed_basepoint=privkeys[3],
-                revocation_basepoint=privkeys[4],
-                to_self_delay=l_csv,
-                dust_limit_sat=l_dust,
-                max_htlc_value_in_flight_msat=local_max_inflight,
-                max_accepted_htlcs=5,
-                initial_msat=local_amount,
-                reserve_sat=0,
-                per_commitment_secret_seed=seed,
-                funding_locked_received=True,
-                current_commitment_signature=None,
-                current_htlc_signatures=None,
-                htlc_minimum_msat=1,
-                upfront_shutdown_script=b'',
-                announcement_node_sig=b'',
-                announcement_bitcoin_sig=b'',
-            ),
-            "constraints":lnpeer.ChannelConstraints(
-                flags=0,
-                capacity=funding_sat,
-                is_initiator=is_initiator,
-                funding_txn_minimum_depth=3,
-            ),
-            "node_id":other_node_id.hex(),
-            'onion_keys': {},
-            'data_loss_protect_remote_pcp': {},
-            'state': 'PREOPENING',
-            'log': {},
-            'unfulfilled_htlcs': {},
-            'revocation_store': {},
-            'channel_type': channel_type,
-    }
-    return StoredDict(state, None)
-
-
-def bip32(sequence):
-    node = bip32_utils.BIP32Node.from_rootseed(b"9dk", xtype='standard').subkey_at_private_derivation(sequence)
-    k = node.eckey.get_secret_bytes()
-    assert len(k) == 32
-    assert type(k) is bytes
-    return k
-
-
-def create_test_channels(*, feerate=6000, local_msat=None, remote_msat=None,
-                         alice_name="alice", bob_name="bob",
-                         alice_pubkey=b"\x01"*33, bob_pubkey=b"\x02"*33, random_seed=None,
-                         anchor_outputs=False,
-                         local_max_inflight=None, remote_max_inflight=None):
-    if random_seed is None:  # needed for deterministic randomness
-        random_seed = os.urandom(32)
-    random_gen = PRNG(random_seed)
-    funding_txid = binascii.hexlify(random_gen.get_bytes(32)).decode("ascii")
-    funding_index = 0
-    funding_sat = ((local_msat + remote_msat) // 1000) if local_msat is not None and remote_msat is not None else (bitcoin.COIN * 10)
-    local_amount = local_msat if local_msat is not None else (funding_sat * 1000 // 2)
-    remote_amount = remote_msat if remote_msat is not None else (funding_sat * 1000 // 2)
-    local_max_inflight = funding_sat * 1000 if local_max_inflight is None else local_max_inflight
-    remote_max_inflight = funding_sat * 1000 if remote_max_inflight is None else remote_max_inflight
-    alice_raw = [bip32("m/" + str(i)) for i in range(5)]
-    bob_raw = [bip32("m/" + str(i)) for i in range(5,11)]
-    alice_privkeys = [lnutil.Keypair(privkey_to_pubkey(x), x) for x in alice_raw]
-    bob_privkeys = [lnutil.Keypair(privkey_to_pubkey(x), x) for x in bob_raw]
-    alice_pubkeys = [lnutil.OnlyPubkeyKeypair(x.pubkey) for x in alice_privkeys]
-    bob_pubkeys = [lnutil.OnlyPubkeyKeypair(x.pubkey) for x in bob_privkeys]
-
-    alice_seed = random_gen.get_bytes(32)
-    bob_seed = random_gen.get_bytes(32)
-
-    alice_first = lnutil.secret_to_pubkey(
-        int.from_bytes(lnutil.get_per_commitment_secret_from_seed(
-            alice_seed, lnutil.RevocationStore.START_INDEX), "big"))
-    bob_first = lnutil.secret_to_pubkey(
-        int.from_bytes(lnutil.get_per_commitment_secret_from_seed(
-            bob_seed, lnutil.RevocationStore.START_INDEX), "big"))
-
-    alice, bob = (
-        lnchannel.Channel(
-            create_channel_state(
-                funding_txid, funding_index, funding_sat, True, local_amount,
-                remote_amount, alice_privkeys, bob_pubkeys, alice_seed, None,
-                bob_first, other_node_id=bob_pubkey, l_dust=200, r_dust=1300,
-                l_csv=5, r_csv=4, anchor_outputs=anchor_outputs,
-                local_max_inflight=local_max_inflight, remote_max_inflight=remote_max_inflight
-            ),
-            name=f"{alice_name}->{bob_name}",
-            initial_feerate=feerate),
-        lnchannel.Channel(
-            create_channel_state(
-                funding_txid, funding_index, funding_sat, False, remote_amount,
-                local_amount, bob_privkeys, alice_pubkeys, bob_seed, None,
-                alice_first, other_node_id=alice_pubkey, l_dust=1300, r_dust=200,
-                l_csv=4, r_csv=5, anchor_outputs=anchor_outputs,
-                local_max_inflight=remote_max_inflight, remote_max_inflight=local_max_inflight
-            ),
-            name=f"{bob_name}->{alice_name}",
-            initial_feerate=feerate)
-    )
-
-    alice.hm.log[LOCAL]['ctn'] = 0
-    bob.hm.log[LOCAL]['ctn'] = 0
-
-    alice._state = ChannelState.OPEN
-    bob._state = ChannelState.OPEN
-
-    a_out = alice.get_latest_commitment(LOCAL).outputs()
-    b_out = bob.get_next_commitment(REMOTE).outputs()
-    assert a_out == b_out, "\n" + pformat((a_out, b_out))
-
-    sig_from_bob, a_htlc_sigs = bob.sign_next_commitment()
-    sig_from_alice, b_htlc_sigs = alice.sign_next_commitment()
-
-    assert len(a_htlc_sigs) == 0
-    assert len(b_htlc_sigs) == 0
-
-    alice.open_with_first_pcp(bob_first, sig_from_bob)
-    bob.open_with_first_pcp(alice_first, sig_from_alice)
-
-    alice_second = lnutil.secret_to_pubkey(int.from_bytes(lnutil.get_per_commitment_secret_from_seed(alice_seed, lnutil.RevocationStore.START_INDEX - 1), "big"))
-    bob_second = lnutil.secret_to_pubkey(int.from_bytes(lnutil.get_per_commitment_secret_from_seed(bob_seed, lnutil.RevocationStore.START_INDEX - 1), "big"))
-
-    # from funding_locked:
-    alice.config[REMOTE].next_per_commitment_point = bob_second
-    bob.config[REMOTE].next_per_commitment_point = alice_second
-
-    alice._fallback_sweep_address = bitcoin.pubkey_to_address('p2wpkh', alice.config[LOCAL].payment_basepoint.pubkey.hex())
-    bob._fallback_sweep_address = bitcoin.pubkey_to_address('p2wpkh', bob.config[LOCAL].payment_basepoint.pubkey.hex())
-
-    return alice, bob
 
 
 class TestFee(ElectrumTestCase):
@@ -221,13 +53,21 @@ class TestFee(ElectrumTestCase):
     test
     https://github.com/lightningnetwork/lightning-rfc/blob/e0c436bd7a3ed6a028e1cb472908224658a14eca/03-transactions.md#requirements-2
     """
-    def test_fee(self):
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.alice_lnwallet = self.create_mock_lnwallet(name="alice")
+        self.bob_lnwallet = self.create_mock_lnwallet(name="bob")
+
+    async def test_fee(self):
         alice_channel, bob_channel = create_test_channels(
             feerate=253,
-            local_msat=10000000000,
-            remote_msat=5000000000,
-            anchor_outputs=self.TEST_ANCHOR_CHANNELS)
-        expected_value = 9999056 if self.TEST_ANCHOR_CHANNELS else 9999817
+            local_msat=10_000_000_000,
+            remote_msat=5_000_000_000,
+            alice_lnwallet=self.alice_lnwallet,
+            bob_lnwallet=self.bob_lnwallet,
+        )
+        expected_value = 9_999_056 if self.TEST_ANCHOR_CHANNELS else 9_999_817
         self.assertIn(expected_value, [x.value for x in alice_channel.get_latest_commitment(LOCAL).outputs()])
 
 
@@ -249,12 +89,16 @@ class TestChannel(ElectrumTestCase):
         super().setUpClass()
         console_stderr_handler.setLevel(logging.DEBUG)
 
-    def setUp(self):
-        super().setUp()
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.alice_lnwallet = self.create_mock_lnwallet(name="alice")
+        self.bob_lnwallet = self.create_mock_lnwallet(name="bob")
+
         # Create a test channel which will be used for the duration of this
         # unittest. The channel will be funded evenly with Alice having 5 BTC,
         # and Bob having 5 BTC.
-        self.alice_channel, self.bob_channel = create_test_channels(anchor_outputs=self.TEST_ANCHOR_CHANNELS)
+        self.alice_channel, self.bob_channel = create_test_channels(
+            alice_lnwallet=self.alice_lnwallet, bob_lnwallet=self.bob_lnwallet)
 
         self.paymentPreimage = b"\x01" * 32
         paymentHash = bitcoin.sha256(self.paymentPreimage)
@@ -306,7 +150,7 @@ class TestChannel(ElectrumTestCase):
         self.assertNumberNonAnchorOutputs(2, self.alice_channel.get_latest_commitment(REMOTE))
         self.assertNumberNonAnchorOutputs(4, self.alice_channel.get_next_commitment(REMOTE))
 
-    def test_SimpleAddSettleWorkflow(self):
+    async def test_SimpleAddSettleWorkflow(self):
         alice_channel, bob_channel = self.alice_channel, self.bob_channel
         htlc = self.htlc
 
@@ -693,14 +537,169 @@ class TestChannel(ElectrumTestCase):
             self.alice_channel.add_htlc(new)
         self.assertIn('Not enough local balance', cm.exception.args[0])
 
+    def test_unfunded_channel_can_be_removed(self):
+        """
+        Test that an incoming channel which stays unfunded longer than
+        lnutil.CHANNEL_OPENING_TIMEOUT_BLOCKS and lnutil.CHANNEL_OPENING_TIMEOUT_SEC
+        can be removed
+        """
+        # set the init_height and init_timestamp
+        self.current_height = 800_000
+        self.bob_channel.storage['init_height'] = self.current_height
+        self.alice_channel.storage['init_height'] = self.current_height
+        self.bob_channel.storage['init_timestamp'] = int(time.time())
+        self.alice_channel.storage['init_timestamp'] = int(time.time())
 
-class TestChannelAnchors(TestChannel):
-    TEST_ANCHOR_CHANNELS = True
+        mock_lnworker = mock.Mock()
+        mock_blockchain = mock.Mock()
+        mock_lnworker.wallet = mock.Mock()
+        mock_lnworker.wallet.is_up_to_date = lambda: True
+        mock_blockchain.is_tip_stale = lambda: False
+        mock_lnworker.network.blockchain = lambda: mock_blockchain
+        mock_lnworker.network.get_local_height = lambda: self.current_height
+        self.bob_channel.lnworker = mock_lnworker
+        self.alice_channel.lnworker = mock_lnworker
+
+        # test that the non-initiator can remove the channel after timeout
+        self.assertFalse(self.bob_channel.is_initiator())
+        self.bob_channel._state = ChannelState.OPENING
+        self.assertFalse(self.bob_channel.can_be_deleted())
+        self.current_height += lnutil.CHANNEL_OPENING_TIMEOUT_BLOCKS + 1
+        self.assertFalse(self.bob_channel.can_be_deleted())  # needs both block and time based timeout
+        self.bob_channel.storage['init_timestamp'] -= lnutil.CHANNEL_OPENING_TIMEOUT_SEC + 1
+        self.alice_channel.storage['init_timestamp'] -= lnutil.CHANNEL_OPENING_TIMEOUT_SEC + 1
+        self.assertTrue(self.bob_channel.can_be_deleted())  # now both timeouts are reached
+        self.current_height = 800_000  # reset to check if we can delete with just the time based timeout
+        self.assertFalse(self.bob_channel.can_be_deleted())
+
+        # test that the initiator can't remove the channel, even after timeout
+        self.current_height += lnutil.CHANNEL_OPENING_TIMEOUT_BLOCKS + 1
+        self.assertTrue(self.alice_channel.is_initiator())
+        self.alice_channel._state = ChannelState.OPENING
+        self.assertFalse(self.alice_channel.can_be_deleted())
+
+    async def test_update_unfunded_zeroconf_channel(self):
+        """Cover the zeroconf branch of update_unfunded_state"""
+        chan = self.bob_channel
+        chan.set_state(ChannelState.OPEN, force=True)
+        bob = self.bob_lnwallet
+        self.assertFalse(chan.is_initiator())
+        trusted_node = f"{chan.node_id.hex()}@127.0.0.1:9735"
+        chan.storage['channel_type'] |= ChannelType.OPTION_ZEROCONF
+        self.assertTrue(chan.is_zeroconf())
+        # add channel to lnwallet/db
+        bob._channels[chan.channel_id] = chan
+        bob.db.get('channels')[chan.channel_id.hex()] = "something"
+        self.assertIsNotNone(bob.get_channel_by_id(chan.channel_id))
+        chan.storage['init_height'] = 0  # checked by has_funding_timed_out
+        chan.storage['init_timestamp'] = int(time.time())
+        self.assertEqual(chan.get_state(), ChannelState.OPEN)
+        self.assertEqual(chan.balance(LOCAL), 500000000000)
+        bob.config.ZEROCONF_TRUSTED_NODE = trusted_node
+
+        chan.update_unfunded_state()
+
+        # assert nothing happened
+        self.assertIsNotNone(bob.get_channel_by_id(chan.channel_id))
+        self.assertIsNotNone(bob.db.get('channels').get(chan.channel_id.hex()))
+        self.assertEqual(chan.get_state(), ChannelState.OPEN)
+        self.assertEqual(bob.config.ZEROCONF_TRUSTED_NODE, trusted_node)
+
+        # now time out zeroconf funding and try again, however her wallet is not up to date
+        chan.storage['init_timestamp'] -= ZEROCONF_TIMEOUT + 1
+        bob.wallet.is_up_to_date = lambda: False
+
+        chan.update_unfunded_state()
+
+        # assert nothing happened again
+        self.assertIsNotNone(bob.get_channel_by_id(chan.channel_id))
+        self.assertIsNotNone(bob.db.get('channels').get(chan.channel_id.hex()))
+        self.assertEqual(chan.get_state(), ChannelState.OPEN)
+        self.assertEqual(bob.config.ZEROCONF_TRUSTED_NODE, trusted_node)
+        self.assertFalse(chan.is_frozen_for_receiving())
+
+        # now her wallet is synced, and the channel is still unfunded
+        bob.wallet.is_up_to_date = lambda: True
+
+        chan.update_unfunded_state()
+
+        # check zeroconf provider gets unset
+        self.assertEqual(bob.config.ZEROCONF_TRUSTED_NODE, "")
+        self.assertFalse(chan.has_funding_timed_out())
+        self.assertTrue(chan.is_frozen_for_receiving())
+
+        # time out funding (~2 weeks)
+        chan.storage['init_timestamp'] -= CHANNEL_OPENING_TIMEOUT_SEC + 1
+        self.assertTrue(chan.has_funding_timed_out())
+
+        chan.update_unfunded_state()
+
+        # check that channel got removed, now that funding has timed out
+        self.assertIsNone(self.alice_lnwallet.get_channel_by_id(chan.channel_id))
+        self.assertIsNone(self.alice_lnwallet.db.get('channels').get(chan.channel_id.hex()))
+
+    async def test_should_be_closed_due_to_expiring_htlcs_offered_htlcs(self):
+        alice_lnwallet = self.create_mock_lnwallet(name="alice")
+        bob_lnwallet = self.create_mock_lnwallet(name="bob")
+        alice_channel, bob_channel = create_test_channels(alice_lnwallet=alice_lnwallet, bob_lnwallet=bob_lnwallet)
+
+        # no htlcs
+        self.assertFalse(alice_channel.should_be_closed_due_to_expiring_htlcs(local_height=100))
+
+        # one offered htlc, not expired
+        htlc = UpdateAddHtlc(payment_hash=sha256(os.urandom(32)), amount_msat=one_bitcoin_in_msat, cltv_abs=1000)
+        alice_channel.add_htlc(htlc)
+        alice_channel.sign_next_commitment()
+        self.assertFalse(alice_channel.should_be_closed_due_to_expiring_htlcs(local_height=100))
+
+        # expired offered htlc, within startup grace period
+        expired_local_height = 1000 + lnutil.NBLOCK_DEADLINE_DELTA_AFTER_EXPIRY_FOR_OFFERED_HTLCS + 5
+        self.assertFalse(alice_channel.should_be_closed_due_to_expiring_htlcs(expired_local_height))
+
+        # expired offered htlc, past startup grace period
+        alice_lnwallet.instantiation_timestamp -= (lnutil.TIME_FOR_OFFERED_HTLCS_TO_GET_FAILED_OFFCHAIN_ON_RESTART + 10)
+        self.assertTrue(alice_channel.should_be_closed_due_to_expiring_htlcs(expired_local_height))
+
+    async def test_should_be_closed_due_to_expiring_htlcs_received_htlcs(self):
+        alice_lnwallet = self.create_mock_lnwallet(name="alice")
+        bob_lnwallet = self.create_mock_lnwallet(name="bob")
+        alice_channel, bob_channel = create_test_channels(alice_lnwallet=alice_lnwallet, bob_lnwallet=bob_lnwallet)
+
+        preimage = os.urandom(32)
+        htlc = UpdateAddHtlc(payment_hash=sha256(preimage), amount_msat=one_bitcoin_in_msat, cltv_abs=100)
+        expired_height = 100 + lnutil.NBLOCK_DEADLINE_DELTA_BEFORE_EXPIRY_FOR_RECEIVED_HTLCS + 5
+        alice_channel.add_htlc(htlc)
+        bob_htlc_id =  bob_channel.receive_htlc(htlc).htlc_id
+        force_state_transition(alice_channel, bob_channel)
+
+        # preimage wasn't released
+        self.assertFalse(bob_channel.should_be_closed_due_to_expiring_htlcs(local_height=expired_height))
+
+        # now the preimage is released
+        bob_channel.settle_htlc(preimage, bob_htlc_id)
+
+        # still in 30s grace period waiting for peers revack
+        self.assertFalse(bob_channel.should_be_closed_due_to_expiring_htlcs(local_height=expired_height))
+
+        # now the settled htlc is past the grace period
+        bob_channel.htlc_settle_time[bob_htlc_id] = int(time.time()) - 60
+        self.assertTrue(bob_channel.should_be_closed_due_to_expiring_htlcs(local_height=expired_height))
+
+
+class TestChannelNoAnchors(TestChannel):
+    assert TestChannel.TEST_ANCHOR_CHANNELS is True
+    TEST_ANCHOR_CHANNELS = False
 
 
 class TestAvailableToSpend(ElectrumTestCase):
-    def test_DesyncHTLCs(self):
-        alice_channel, bob_channel = create_test_channels(anchor_outputs=self.TEST_ANCHOR_CHANNELS)
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.alice_lnwallet = self.create_mock_lnwallet(name="alice")
+        self.bob_lnwallet = self.create_mock_lnwallet(name="bob")
+
+    async def test_DesyncHTLCs(self):
+        alice_channel, bob_channel = create_test_channels(
+            alice_lnwallet=self.alice_lnwallet, bob_lnwallet=self.bob_lnwallet)
         self.assertEqual(499986152000 if not alice_channel.has_anchors() else 499980692000, alice_channel.available_to_spend(LOCAL))
         self.assertEqual(500000000000, bob_channel.available_to_spend(LOCAL))
 
@@ -745,13 +744,15 @@ class TestAvailableToSpend(ElectrumTestCase):
         self.assertEqual(500000000000, bob_channel.available_to_spend(LOCAL))
         alice_channel.add_htlc(htlc)
 
-    def test_single_payment(self):
+    async def test_single_payment(self):
         alice_channel, bob_channel = create_test_channels(
-            anchor_outputs=self.TEST_ANCHOR_CHANNELS,
             local_msat=4000000000,
             remote_msat=4000000000,
             local_max_inflight=1000000000,
-            remote_max_inflight=2000000000)
+            remote_max_inflight=2000000000,
+            alice_lnwallet=self.alice_lnwallet,
+            bob_lnwallet=self.bob_lnwallet,
+        )
 
         # alice can send 20 but bob can only receive 10, because of stricter receiving rules
         self.assertEqual(2000000000, alice_channel.available_to_spend(LOCAL))
@@ -802,13 +803,17 @@ class TestAvailableToSpend(ElectrumTestCase):
         self.assertEqual(1000000000, alice_channel.available_to_spend(REMOTE))
 
 
-class TestAvailableToSpendAnchors(TestAvailableToSpend):
-    TEST_ANCHOR_CHANNELS = True
+class TestAvailableToSpendNoAnchors(TestAvailableToSpend):
+    assert TestAvailableToSpend.TEST_ANCHOR_CHANNELS is True
+    TEST_ANCHOR_CHANNELS = False
 
 
 class TestChanReserve(ElectrumTestCase):
-    def setUp(self):
-        alice_channel, bob_channel = create_test_channels(anchor_outputs=False)
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        alice_lnwallet = self.create_mock_lnwallet(name="alice")
+        bob_lnwallet = self.create_mock_lnwallet(name="bob")
+        alice_channel, bob_channel = create_test_channels(alice_lnwallet=alice_lnwallet, bob_lnwallet=bob_lnwallet)
         alice_min_reserve = int(.5 * one_bitcoin_in_msat // 1000)
         # We set Bob's channel reserve to a value that is larger than
         # his current balance in the channel. This will ensure that
@@ -936,14 +941,20 @@ class TestChanReserve(ElectrumTestCase):
         self.assertEqual(self.bob_channel.available_to_spend(LOCAL), amt2)
 
 
-class TestChanReserveAnchors(TestChanReserve):
-    TEST_ANCHOR_CHANNELS = True
+class TestChanReserveNoAnchors(TestChanReserve):
+    assert TestChanReserve.TEST_ANCHOR_CHANNELS is True
+    TEST_ANCHOR_CHANNELS = False
 
 
 class TestDust(ElectrumTestCase):
-    def test_DustLimit(self):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.alice_lnwallet = self.create_mock_lnwallet(name="alice")
+        self.bob_lnwallet = self.create_mock_lnwallet(name="bob")
+
+    async def test_DustLimit(self):
         """Test that addition of an HTLC below the dust limit changes the balances."""
-        alice_channel, bob_channel = create_test_channels(anchor_outputs=self.TEST_ANCHOR_CHANNELS)
+        alice_channel, bob_channel = create_test_channels(alice_lnwallet=self.alice_lnwallet, bob_lnwallet=self.bob_lnwallet)
         dust_limit_alice = alice_channel.config[LOCAL].dust_limit_sat
         dust_limit_bob = bob_channel.config[LOCAL].dust_limit_sat
         self.assertLess(dust_limit_alice, dust_limit_bob)
@@ -998,11 +1009,12 @@ class TestDust(ElectrumTestCase):
         self.assertEqual(htlc_amt, alice_channel.total_msat(SENT) // 1000)
 
 
-class TestDustAnchors(TestDust):
-    TEST_ANCHOR_CHANNELS = True
+class TestDustNoAnchors(TestDust):
+    assert TestDust.TEST_ANCHOR_CHANNELS is True
+    TEST_ANCHOR_CHANNELS = False
 
 
-def force_state_transition(chanA, chanB):
+def force_state_transition(chanA: Channel, chanB: Channel) -> None:
     chanB.receive_new_commitment(*chanA.sign_next_commitment())
     rev = chanB.revoke_current_commitment()
     bob_sig, bob_htlc_sigs = chanB.sign_next_commitment()

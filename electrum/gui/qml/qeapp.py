@@ -23,6 +23,7 @@ from electrum.network import Network
 from electrum.plugin import run_hook
 from electrum.gui.common_qt.util import get_font_id
 from electrum.util import profiler
+from electrum.lnurl import SUPPORTED_LNURL_SCHEMES
 
 from .qeconfig import QEConfig
 from .qedaemon import QEDaemon
@@ -46,6 +47,7 @@ from .qeswaphelper import QESwapHelper
 from .qewizard import QENewWalletWizard, QEServerConnectWizard, QETermsOfUseWizard
 from .qemodelfilter import QEFilterProxyModel
 from .qebip39recovery import QEBip39RecoveryListModel
+from .qebiometrics import QEBiometrics
 
 if TYPE_CHECKING:
     from electrum.simple_config import SimpleConfig
@@ -234,7 +236,9 @@ class QEAppController(BaseCrashReporter, QObject):
         data = str(intent.getDataString())
         self.logger.debug(f'received intent: {repr(data)}')
         scheme = str(intent.getScheme()).lower()
-        if scheme == BITCOIN_BIP21_URI_SCHEME or scheme == LIGHTNING_URI_SCHEME:
+        if scheme == BITCOIN_BIP21_URI_SCHEME \
+                or scheme == LIGHTNING_URI_SCHEME \
+                or scheme in SUPPORTED_LNURL_SCHEMES:
             self.uriReceived.emit(data)
 
     def startup_finished(self):
@@ -537,6 +541,7 @@ class ElectrumQmlApplication(QGuiApplication):
         self.daemon = QEDaemon(daemon, self.plugins)
         self.appController = QEAppController(self, self.plugins)
         self.maxAmount = QEAmount(is_max=True)
+        self.biometrics = QEBiometrics(config=config, parent=self)
         self.context.setContextProperty('AppController', self.appController)
         self.context.setContextProperty('Config', self.config)
         self.context.setContextProperty('Network', self.network)
@@ -544,6 +549,7 @@ class ElectrumQmlApplication(QGuiApplication):
         self.context.setContextProperty('FixedFont', self.fixedFont)
         self.context.setContextProperty('MAX', self.maxAmount)
         self.context.setContextProperty('QRIP', self.qr_ip_h)
+        self.context.setContextProperty('Biometrics', self.biometrics)
         self.context.setContextProperty('BUILD', {
             'electrum_version': version.ELECTRUM_VERSION,
             'protocol_version': f"[{version.PROTOCOL_VERSION_MIN}, {version.PROTOCOL_VERSION_MAX}]",
@@ -553,6 +559,7 @@ class ElectrumQmlApplication(QGuiApplication):
         self.context.setContextProperty('UI_UNIT_NAME', {
             "FEERATE_SAT_PER_VBYTE": electrum.util.UI_UNIT_NAME_FEERATE_SAT_PER_VBYTE,
             "FEERATE_SAT_PER_VB":    electrum.util.UI_UNIT_NAME_FEERATE_SAT_PER_VB,
+            "FIXED_SAT":             electrum.util.UI_UNIT_NAME_FIXED_SAT,
             "TXSIZE_VBYTES":         electrum.util.UI_UNIT_NAME_TXSIZE_VBYTES,
             "MEMPOOL_MB":            electrum.util.UI_UNIT_NAME_MEMPOOL_MB,
         })

@@ -208,12 +208,13 @@ class AddressSynchronizer(Logger, EventListener):
             self.verifier = SPV(self.network, self)
             self.asyncio_loop = network.asyncio_loop
             self.register_callbacks()
+            self._update_stored_local_height()
 
     @event_listener
     @with_lock
     def on_event_blockchain_updated(self, *args):
         self.invalidate_cache()
-        self.db.put('stored_height', self.get_local_height())
+        self._update_stored_local_height()
 
     async def stop(self):
         if self.network:
@@ -292,7 +293,7 @@ class AddressSynchronizer(Logger, EventListener):
         if tx_hash is None:
             raise Exception("cannot add tx without txid to wallet history")
         # For sanity, try to serialize and deserialize tx early:
-        tx_from_any(str(tx))  # see if raises (no-side-effects)
+        tx_from_any(str(tx), sanitize=False)  # see if raises (no-side-effects)
         with self.lock:
             # NOTE: returning if tx in self.transactions might seem like a good idea
             # BUT we track is_mine inputs in a txn, and during subsequent calls
@@ -413,8 +414,7 @@ class AddressSynchronizer(Logger, EventListener):
             tx = self.db.remove_transaction(tx_hash)
             remove_from_spent_outpoints()
             self._remove_tx_from_local_history(tx_hash)
-            for addr in itertools.chain(self.db.get_txi_addresses(tx_hash), self.db.get_txo_addresses(tx_hash)):
-                self.invalidate_cache()
+            self.invalidate_cache()
             self.db.remove_txi(tx_hash)
             self.db.remove_txo(tx_hash)
             self.db.remove_tx_fee(tx_hash)
@@ -653,6 +653,7 @@ class AddressSynchronizer(Logger, EventListener):
         with self.lock:
             self.unverified_tx.pop(tx_hash, None)
             self.db.add_verified_tx(tx_hash, info)
+            self.invalidate_cache()
         util.trigger_callback('adb_added_verified_tx', self, tx_hash)
 
     @with_lock
@@ -693,6 +694,9 @@ class AddressSynchronizer(Logger, EventListener):
         if cached_local_height is not None:
             return cached_local_height
         return self.network.get_local_height() if self.network else self.db.get('stored_height', 0)
+
+    def _update_stored_local_height(self) -> None:
+        self.db.put('stored_height', self.get_local_height())
 
     def set_future_tx(self, txid: str, *, wanted_height: int):
         """Mark a local tx as "future" (encumbered by a timelock).
@@ -1043,7 +1047,6 @@ class AddressSynchronizer(Logger, EventListener):
     def get_spender(self, outpoint: str) -> Optional[str]:
         """
         returns txid spending outpoint.
-        subscribes to addresses as a side effect.
         """
         prev_txid, index = outpoint.split(':')
         spender_txid = self.db.get_spent_outpoint(prev_txid, int(index))
@@ -1051,15 +1054,15 @@ class AddressSynchronizer(Logger, EventListener):
         tx_mined_status = self.get_tx_height(spender_txid)
         if tx_mined_status.height() in [TX_HEIGHT_LOCAL, TX_HEIGHT_FUTURE]:
             spender_txid = None
-        if not spender_txid:
-            return None
+        return spender_txid
+
+    def subscribe_to_outputs(self, spender_txid: str):
         spender_tx = self.get_transaction(spender_txid)
         for i, o in enumerate(spender_tx.outputs()):
             if o.address is None:
                 continue
             if not self.is_mine(o.address):
                 self.add_address(o.address)
-        return spender_txid
 
     def get_tx_mined_depth(self, txid: str):
         if not txid:

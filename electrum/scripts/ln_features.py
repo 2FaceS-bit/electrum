@@ -34,6 +34,7 @@ PRESYNC = False  # should we sync the graph or take it from an already synced da
 
 
 config = SimpleConfig({"testnet": IS_TESTNET, "verbosity": VERBOSITY})
+config.get_selected_chain().set_as_network()
 configure_logging(config)
 
 loop, stopping_fut, loop_thread = create_and_start_event_loop()
@@ -41,8 +42,6 @@ loop, stopping_fut, loop_thread = create_and_start_event_loop()
 # takes some time
 time.sleep(2)
 
-if IS_TESTNET:
-    constants.BitcoinTestnet.set_as_network()
 daemon = Daemon(config, listen_jsonrpc=False)
 network = daemon.network
 assert network.asyncio_loop.is_running()
@@ -81,7 +80,7 @@ async def worker(work_queue: asyncio.Queue, results_queue: asyncio.Queue, flag):
 
         print(f"worker connecting to {connect_str}")
         try:
-            peer = await wallet.lnworker.add_peer(connect_str)
+            peer = await wallet.lnworker.lnpeermgr.add_peer(connect_str)
             res = await util.wait_for2(peer.initialized, TIMEOUT)
             if res:
                 if peer.features & flag == work['features'] & flag:

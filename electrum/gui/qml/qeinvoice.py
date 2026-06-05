@@ -1,10 +1,10 @@
 import copy
 import threading
 from enum import IntEnum
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from urllib.parse import urlparse
 
-from PyQt6.QtCore import pyqtProperty, pyqtSignal, pyqtSlot, QObject, pyqtEnum, QTimer
+from PyQt6.QtCore import pyqtProperty, pyqtSignal, pyqtSlot, QObject, pyqtEnum, QTimer, QVariant
 
 from electrum.i18n import _
 from electrum.logging import get_logger
@@ -16,13 +16,15 @@ from electrum.transaction import PartialTxOutput, TxOutput
 from electrum.lnutil import format_short_channel_id
 from electrum.lnurl import LNURL6Data
 from electrum.bitcoin import COIN, address_to_script
-from electrum.paymentrequest import PaymentRequest
 from electrum.payment_identifier import PaymentIdentifier, PaymentIdentifierState, PaymentIdentifierType
 from electrum.network import Network
+from electrum.util import event_listener
+
+from electrum.gui.common_qt.util import QtEventListener
 
 from .qetypes import QEAmount
 from .qewallet import QEWallet
-from .util import status_update_timer_interval, QtEventListener, event_listener
+from .util import status_update_timer_interval
 from ...util import InvoiceError
 
 
@@ -63,6 +65,7 @@ class QEInvoice(QObject, QtEventListener):
         self._invoiceType = QEInvoice.Type.Invalid
         self._effectiveInvoice = None  # type: Optional[Invoice]
         self._userinfo = ''
+        self._paid_in_this_session = False
         self._lnprops = {}
         self._amount = QEAmount()
         self._amountOverride = QEAmount()
@@ -86,7 +89,7 @@ class QEInvoice(QObject, QtEventListener):
         if wallet == self._wallet.wallet and key == self.key:
             self.statusChanged.emit()
             self.determine_can_pay()
-            self.userinfo = _('Paid!')
+            self.update_userinfo()
 
     @event_listener
     def on_event_payment_failed(self, wallet, key, reason):
@@ -109,12 +112,13 @@ class QEInvoice(QObject, QtEventListener):
             self.determine_can_pay()
 
     walletChanged = pyqtSignal()
-    @pyqtProperty(QEWallet, notify=walletChanged)
-    def wallet(self):
+    @pyqtProperty(QVariant, notify=walletChanged)
+    def wallet(self) -> QEWallet:
         return self._wallet
 
     @wallet.setter
     def wallet(self, wallet: QEWallet):
+        assert wallet is None or isinstance(wallet, QEWallet)
         if self._wallet != wallet:
             self._wallet = wallet
             self.walletChanged.emit()
@@ -151,12 +155,13 @@ class QEInvoice(QObject, QtEventListener):
         self._amount.copyFrom(QEAmount(from_invoice=self._effectiveInvoice))
         return self._amount
 
-    @pyqtProperty(QEAmount, notify=amountOverrideChanged)
-    def amountOverride(self):
+    @pyqtProperty(QVariant, notify=amountOverrideChanged)
+    def amountOverride(self) -> QEAmount:
         return self._amountOverride
 
     @amountOverride.setter
     def amountOverride(self, new_amount: QEAmount):
+        assert new_amount is None or isinstance(new_amount, QEAmount)
         self._logger.debug(f'set new override amount {repr(new_amount)}')
         self._amountOverride.copyFrom(new_amount)
         self.amountOverrideChanged.emit()
@@ -258,9 +263,10 @@ class QEInvoice(QObject, QtEventListener):
 
     def name_for_node_id(self, node_id):
         lnworker = self._wallet.wallet.lnworker
-        return (lnworker.get_node_alias(node_id) if lnworker else None) or node_id.hex()
+        return (lnworker.lnpeermgr.get_node_alias(node_id) if lnworker else None) or node_id.hex()
 
     def set_effective_invoice(self, invoice: Invoice):
+        self._paid_in_this_session = False
         self._effectiveInvoice = invoice
 
         if invoice is None:
@@ -327,23 +333,12 @@ class QEInvoice(QObject, QtEventListener):
                 PR_UNKNOWN: _('Invoice has unknown status'),
             }[_status]
 
-        if self.invoiceType == QEInvoice.Type.LightningInvoice:
-            if status in [PR_UNPAID, PR_FAILED]:
-                if self.get_max_spendable_lightning() >= amount.satsInt:
-                    lnaddr = self._effectiveInvoice._lnaddr
-                    if lnaddr.amount and amount.satsInt < lnaddr.amount * COIN:
-                        self.userinfo = _('Cannot pay less than the amount specified in the invoice')
-                elif not self.address or self.get_max_spendable_onchain() < amount.satsInt:
-                    # TODO: for onchain: validate address? subtract fee?
-                    self.userinfo = _('Insufficient balance')
-            else:
-                self.userinfo = userinfo_for_invoice_status(status)
-        elif self.invoiceType == QEInvoice.Type.OnchainInvoice:
-            if status in [PR_UNPAID, PR_FAILED]:
-                if not ((amount.isMax and self.get_max_spendable_onchain() > 0) or (self.get_max_spendable_onchain() >= amount.satsInt)):
-                    self.userinfo = _('Insufficient balance')
-            else:
-                self.userinfo = userinfo_for_invoice_status(status)
+        if status in [PR_UNPAID, PR_FAILED]:
+            x, self.userinfo = self.check_can_pay_amount(amount)
+        elif status == PR_PAID and self._paid_in_this_session:
+            self.userinfo = _('Paid!')
+        else:
+            self.userinfo = userinfo_for_invoice_status(status)
 
     def determine_can_pay(self):
         self.canPay = False
@@ -364,24 +359,25 @@ class QEInvoice(QObject, QtEventListener):
         if amount.isEmpty and status == PR_UNPAID:  # unspecified amount
             return
 
+        if status in [PR_UNPAID, PR_FAILED]:
+            self.canPay, x = self.check_can_pay_amount(amount)
+
+    def check_can_pay_amount(self, amount: QEAmount) -> Tuple[bool, Optional[str]]:
+        assert self.status in [PR_UNPAID, PR_FAILED]
         if self.invoiceType == QEInvoice.Type.LightningInvoice:
-            if status in [PR_UNPAID, PR_FAILED]:
-                if self.get_max_spendable_lightning() >= amount.satsInt:
-                    lnaddr = self._effectiveInvoice._lnaddr
-                    if not (lnaddr.amount and amount.satsInt < lnaddr.amount * COIN):
-                        self.canPay = True
-                elif self.address and self.get_max_spendable_onchain() > amount.satsInt:
-                    # TODO: validate address?
-                    # TODO: subtract fee?
-                    self.canPay = True
+            if self.get_max_spendable_lightning() * 1000 >= amount.msatsInt:
+                lnaddr = self._effectiveInvoice._lnaddr
+                if lnaddr.amount and amount.msatsInt < lnaddr.amount * COIN * 1000:
+                    return False, _('Cannot pay less than the amount specified in the invoice')
+                else:
+                    return True, None
+            elif self.address and self.get_max_spendable_onchain() > amount.satsInt:
+                return True, None
         elif self.invoiceType == QEInvoice.Type.OnchainInvoice:
-            if status in [PR_UNPAID, PR_FAILED]:
-                if amount.isMax and self.get_max_spendable_onchain() > 0:
-                    # TODO: dust limit?
-                    self.canPay = True
-                elif self.get_max_spendable_onchain() >= amount.satsInt:
-                    # TODO: subtract fee?
-                    self.canPay = True
+            if (amount.isMax and self.get_max_spendable_onchain() > 0) or (self.get_max_spendable_onchain() >= amount.satsInt):
+                return True, None
+
+        return False, _('Insufficient balance')
 
     @pyqtSlot()
     def payLightningInvoice(self):
@@ -395,8 +391,9 @@ class QEInvoice(QObject, QtEventListener):
         if self.amount.isEmpty:
             if self.amountOverride.isEmpty:
                 raise Exception('can not pay 0 amount')
-            amount_msat = self.amountOverride.satsInt * 1000
+            amount_msat = self.amountOverride.msatsInt
 
+        self._paid_in_this_session = True
         self._wallet.pay_lightning_invoice(self._effectiveInvoice, amount_msat)
 
     def get_max_spendable_onchain(self):
@@ -455,7 +452,7 @@ class QEInvoiceParser(QEInvoice):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self._pi = None
+        self._pi = None  # type: Optional[PaymentIdentifier]
         self._lnurlData = None
         self._busy = False
 
@@ -463,7 +460,7 @@ class QEInvoiceParser(QEInvoice):
 
     @pyqtSlot(object)
     def fromResolvedPaymentIdentifier(self, resolved_pi: PaymentIdentifier) -> None:
-        self.canPay = False
+        self.clear()
         self.amountOverride = QEAmount()
         if resolved_pi:
             assert not resolved_pi.need_resolve()
@@ -509,27 +506,12 @@ class QEInvoiceParser(QEInvoice):
         self._effectiveInvoice = None
         self.invoiceChanged.emit()
 
-    def create_onchain_invoice(self, outputs, message, payment_request, uri):
+    def create_onchain_invoice(self, *, outputs, message, uri):
         return self._wallet.wallet.create_invoice(
             outputs=outputs,
             message=message,
-            pr=payment_request,
-            URI=uri
-            )
-
-    def _bip70_payment_request_resolved(self, pr: 'PaymentRequest'):
-        self._logger.debug('resolved payment request')
-        if Network.run_from_another_thread(pr.verify()):
-            invoice = Invoice.from_bip70_payreq(pr, height=0)
-            if self._wallet.wallet.get_invoice_status(invoice) == PR_PAID:
-                self.validationError.emit('unknown', _('Invoice already paid'))
-            elif pr.has_expired():
-                self.validationError.emit('unknown', _('Payment request has expired'))
-            else:
-                self.setValidOnchainInvoice(invoice)
-                self.validationSuccess.emit()
-        else:
-            self.validationError.emit('unknown', f'invoice error:\n{pr.error}')
+            URI=uri,
+        )
 
     def validateRecipient(self, pi: PaymentIdentifier):
         if not pi:
@@ -539,9 +521,10 @@ class QEInvoiceParser(QEInvoice):
         self._pi = pi
         if not self._pi.is_valid() or self._pi.type not in [
             PaymentIdentifierType.SPK, PaymentIdentifierType.BIP21,
-            PaymentIdentifierType.BIP70, PaymentIdentifierType.BOLT11,
+            PaymentIdentifierType.BOLT11,
             PaymentIdentifierType.LNADDR, PaymentIdentifierType.LNURLP,
-            PaymentIdentifierType.EMAILLIKE, PaymentIdentifierType.DOMAINLIKE
+            PaymentIdentifierType.EMAILLIKE, PaymentIdentifierType.DOMAINLIKE,
+            PaymentIdentifierType.OPENALIAS,
         ]:
             self.validationError.emit('unknown', _('Unknown invoice'))
             return
@@ -564,14 +547,10 @@ class QEInvoiceParser(QEInvoice):
             self.on_lnurl_pay(self._pi.lnurl_data)
             return
 
-        if self._pi.type == PaymentIdentifierType.BIP70:
-            self._bip70_payment_request_resolved(self._pi.bip70_data)
-            return
-
         if self._pi.is_available():
             if self._pi.type in [PaymentIdentifierType.SPK, PaymentIdentifierType.OPENALIAS]:
                 outputs = [PartialTxOutput(scriptpubkey=self._pi.spk, value=0)]
-                invoice = self.create_onchain_invoice(outputs, None, None, None)
+                invoice = self.create_onchain_invoice(outputs=outputs, message=None, uri=None)
                 self._logger.debug(repr(invoice))
                 self.setValidOnchainInvoice(invoice)
                 self.validationSuccess.emit()
@@ -605,7 +584,7 @@ class QEInvoiceParser(QEInvoice):
         outputs = [PartialTxOutput.from_address_and_value(bip21['address'], amount)]
         self._logger.debug(outputs)
         message = bip21.get('message', '')
-        invoice = self.create_onchain_invoice(outputs, message, None, bip21)
+        invoice = self.create_onchain_invoice(outputs=outputs, message=message, uri=bip21)
         self._logger.debug(repr(invoice))
         self.setValidOnchainInvoice(invoice)
         self.validationSuccess.emit()
@@ -664,7 +643,8 @@ class QEInvoiceParser(QEInvoice):
         if orig_amount * 1000 != invoice.amount_msat:  # TODO msat precision can cause trouble here
             raise Exception('Unexpected amount in invoice, differs from lnurl-pay specified amount')
 
-        self.fromResolvedPaymentIdentifier(
+        self.amountOverride = QEAmount()
+        self.validateRecipient(
             PaymentIdentifier(self._wallet.wallet, invoice.lightning_invoice)
         )
 

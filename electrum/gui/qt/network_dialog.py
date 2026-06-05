@@ -41,11 +41,10 @@ from electrum.logging import get_logger
 from electrum.util import is_valid_websocket_url
 from electrum.gui import messages
 
+from electrum.gui.common_qt.util import QtEventListener, qt_event_listener
 from .util import (
-    Buttons, CloseButton, HelpButton, read_QIcon, char_width_in_lineedit, PasswordLineEdit, QtEventListener,
-    qt_event_listener, Spinner, HelpLabel
+    Buttons, CloseButton, HelpButton, read_QIcon, char_width_in_lineedit, PasswordLineEdit, Spinner, HelpLabel
 )
-
 
 _logger = get_logger(__name__)
 
@@ -149,9 +148,6 @@ class NodesListWidget(QTreeWidget):
     def update(self):
         self.clear()
         network = self.network
-        servers = self.network.get_servers()
-
-        use_tor = bool(network.is_proxy_tor)
 
         # connected servers
         connected_servers_item = QTreeWidgetItem([_("Connected nodes"), ''])
@@ -185,19 +181,8 @@ class NodesListWidget(QTreeWidget):
         # disconnected servers
         disconnected_servers_item = QTreeWidgetItem([_("Other known servers"), ""])
         disconnected_servers_item.setData(0, self.ITEMTYPE_ROLE, self.ItemType.TOPLEVEL)
-        connected_hosts = set([iface.host for ifaces in chains.values() for iface in ifaces])
-        protocol = PREFERRED_NETWORK_PROTOCOL
-        server_addrs = [
-            ServerAddr(_host, port, protocol=protocol)
-            for _host, d in servers.items()
-            if (port := d.get(protocol))]
-        server_addrs.sort(key=lambda x: (-network.is_server_bookmarked(x), str(x)))
-        for server in server_addrs:
-            if server.host in connected_hosts:
-                continue
-            if server.host.endswith('.onion') and not use_tor:
-                continue
-            item = QTreeWidgetItem([server.net_addr_str(), ""])
+        for server in network.get_disconnected_server_addrs():
+            item = QTreeWidgetItem([server.to_friendly_name(), ""])
             item.setData(0, self.ITEMTYPE_ROLE, self.ItemType.DISCONNECTED_SERVER)
             item.setData(0, self.SERVER_ADDR_ROLE, server)
             if network.is_server_bookmarked(server):
@@ -375,6 +360,8 @@ class ServerWidget(QWidget, QtEventListener):
         ConnectMode.ONESERVER: messages.MSG_CONNECTMODE_ONESERVER,
     }
 
+    server_e_valid = pyqtSignal(bool)
+
     def __init__(self, network: Network, parent=None):
         super().__init__(parent)
         self.network = network
@@ -404,6 +391,7 @@ class ServerWidget(QWidget, QtEventListener):
         grid.addWidget(self.connect_combo, 0, 1, 1, 3)
 
         self.server_e = QLineEdit()
+        self.server_e.textChanged.connect(self.validate_server_e)
         self.server_e.editingFinished.connect(self.on_server_settings_changed)
         grid.addWidget(QLabel(_('Server') + ':'), 1, 0)
         grid.addWidget(self.server_e, 1, 1, 1, 3)
@@ -516,6 +504,7 @@ class ServerWidget(QWidget, QtEventListener):
                 self.status_label_header, self.status_label, self.status_label_helpbutton,
                 self.height_label_header, self.height_label, self.height_label_helpbutton]:
             item.setVisible(self.network._was_started)
+        self.validate_server_e()
         msg = _('Fork detection disabled') if self.is_one_server() else ''
         if self.network._was_started:
             # Network was started, so we don't run in initial setup wizard.
@@ -535,6 +524,15 @@ class ServerWidget(QWidget, QtEventListener):
                 else:
                     msg += _('Your server is on branch {0} ({1} blocks)').format(name, chain.get_branch_size())
         self.split_label.setText(msg)
+
+    def validate_server_e(self):
+        if not self.server_e.isEnabled():
+            self.server_e.setStyleSheet("")
+            self.server_e_valid.emit(True)
+            return
+        server = ServerAddr.from_str_with_inference(self.server_e.text())
+        self.server_e.setStyleSheet("background-color: rgba(255, 0, 0, 0.2);" if not server else "")
+        self.server_e_valid.emit(server is not None)
 
     def update_from_config(self):
         auto_connect = self.config.NETWORK_AUTO_CONNECT

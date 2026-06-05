@@ -2,7 +2,7 @@
 export HOME=~
 set -eu
 
-TEST_ANCHOR_CHANNELS=True
+TEST_SRK_CHANNELS=False
 
 # alice -> bob -> carol
 
@@ -22,7 +22,7 @@ function wait_until_htlcs_settled()
 {
     msg="wait until $1's local_unsettled_sent is zero"
     cmd="./run_electrum --regtest -D /tmp/$1"
-    declare -i timeout_sec=30
+    declare -i timeout_sec=120
     declare -i elapsed_sec=0
 
     while unsettled=$($cmd list_channels | jq '.[] | .local_unsettled_sent') && [ $unsettled != "0" ]; do
@@ -44,7 +44,7 @@ function wait_for_balance()
 {
     msg="wait until $1's balance reaches $2"
     cmd="./run_electrum --regtest -D /tmp/$1"
-    declare -i timeout_sec=30
+    declare -i timeout_sec=120
     declare -i elapsed_sec=0
 
     while balance=$($cmd getbalance | jq '[.confirmed, .unconfirmed] | to_entries | map(select(.value != null).value) | map(tonumber) | add ') && (( $(echo "$balance < $2" | bc -l) )); do
@@ -65,7 +65,7 @@ function wait_until_channel_open()
 {
     msg="wait until $1 sees channel open"
     cmd="./run_electrum --regtest -D /tmp/$1"
-    declare -i timeout_sec=30
+    declare -i timeout_sec=120
     declare -i elapsed_sec=0
 
     while channel_state=$($cmd list_channels | jq '.[0] | .state' | tr -d '"') && [ $channel_state != "OPEN" ]; do
@@ -86,7 +86,7 @@ function wait_until_channel_closed()
 {
     msg="wait until $1 sees channel closed"
     cmd="./run_electrum --regtest -D /tmp/$1"
-    declare -i timeout_sec=30
+    declare -i timeout_sec=120
     declare -i elapsed_sec=0
 
     while [[ $($cmd list_channels | jq '.[0].state' | tr -d '"') != "CLOSED" ]]; do
@@ -107,7 +107,7 @@ function wait_until_preimage()
 {
     msg="wait until $1 has preimage for $2"
     cmd="./run_electrum --regtest -D /tmp/$1"
-    declare -i timeout_sec=30
+    declare -i timeout_sec=120
     declare -i elapsed_sec=0
 
     while [[ $($cmd get_invoice $2 | jq '.preimage' | tr -d '"') == "null" ]]; do
@@ -127,10 +127,12 @@ function wait_until_preimage()
 function wait_until_spent()
 {
     msg="wait until $1:$2 is spent"
-    declare -i timeout_sec=30
+    declare -i timeout_sec=120
     declare -i elapsed_sec=0
 
-    while [[ $($bitcoin_cli gettxout $1 $2) ]]; do
+    while true; do
+        utxo=$($bitcoin_cli gettxout $1 $2)
+        if [[ -z "$utxo" ]]; then break; fi  # utxo is spent (or never existed!)
         if ((elapsed_sec > timeout_sec)); then
             printf "Timeout of %i s exceeded\n" "$elapsed_sec"
             exit 1
@@ -141,6 +143,28 @@ function wait_until_spent()
         msg="$msg."
         printf "$msg\r"
     done
+    printf "\n"
+}
+
+function wait_for_chain_tip()
+{
+    msg="waiting until $1 catches up to chain tip"
+    cmd="./run_electrum --regtest -D /tmp/$1"
+    declare -i timeout_sec=120
+    declare -i elapsed_sec=0
+
+    printf "$msg"
+    while (( $($cmd getinfo | jq '.blockchain_height') < $($bitcoin_cli getblockcount) )); do
+        if ((elapsed_sec > timeout_sec)); then
+            printf "Timeout of %i s exceeded\n" "$elapsed_sec"
+            exit 1
+        fi
+        sleep 1
+        elapsed_sec=$((elapsed_sec + 1))
+        printf '.'
+    done
+
+    $cmd wait_for_sync > /dev/null
     printf "\n"
 }
 
@@ -167,7 +191,7 @@ if [[ $1 == "init" ]]; then
     rm -rf /tmp/$2/
     agent="./run_electrum --regtest -D /tmp/$2"
     $agent create --offline > /dev/null
-    $agent setconfig --offline enable_anchor_channels $TEST_ANCHOR_CHANNELS
+    $agent setconfig --offline test_ln_open_srk_channels $TEST_SRK_CHANNELS
     $agent setconfig --offline log_to_file True
     $agent setconfig --offline use_gossip True
     $agent setconfig --offline server 127.0.0.1:51001:t
@@ -228,6 +252,11 @@ fi
 
 
 if [[ $1 == "backup" ]]; then
+    # Alice has two channels with Bob.
+    # - chan1 has on-chain op_return backups,
+    # - chan2 has an imported backup.
+    # Alice restores from seed, and also imports backup for chan2.
+    # Test "request_force_close" works for both channels.
     wait_for_balance alice 1
     echo "alice opens channel"
     bob_node=$($bob nodeid)
@@ -236,7 +265,7 @@ if [[ $1 == "backup" ]]; then
     $alice setconfig use_recoverable_channels False
     channel2=$($alice open_channel $bob_node 0.15 --password='')
     new_blocks 3
-    wait_until_channel_open alice
+    wait_until_channel_open alice  # FIXME wait for *both* channels?
     backup=$($alice export_channel_backup $channel2)
     seed=$($alice getseed --password='')
     $alice stop
@@ -292,23 +321,44 @@ if [[ $1 == "collaborative_close" ]]; then
 fi
 
 
-if [[ $1 == "swapserver_success" ]]; then
+if [[ $1 == "swapserver_success_reverse" ]]; then
     wait_for_balance alice 1
     echo "alice opens channel"
     bob_node=$($bob nodeid)
     channel=$($alice open_channel $bob_node 0.15 --password='')
     new_blocks 3
     wait_until_channel_open alice
-    echo "alice initiates swap"
+    echo "alice initiates reverse-swap"
     dryrun=$($alice reverse_swap 0.02 dryrun)
     onchain_amount=$(echo $dryrun| jq -r ".onchain_amount")
     prepayment=$(echo $dryrun| jq -r ".prepayment")
     swap=$($alice reverse_swap 0.02 $onchain_amount --prepayment $prepayment)
     echo $swap | jq
     funding_txid=$(echo $swap| jq -r ".funding_txid")
+    assert_utxo_exists $funding_txid 0
     new_blocks 1
     wait_until_spent $funding_txid 0
     wait_until_htlcs_settled alice
+fi
+
+
+if [[ $1 == "swapserver_success_forward" ]]; then
+    wait_for_balance alice 1
+    echo "alice opens channel"
+    bob_node=$($bob nodeid)
+    channel=$($alice open_channel $bob_node 0.15 --password='' --push_amount=0.075)
+    new_blocks 3
+    wait_until_channel_open alice
+    echo "alice initiates forward-swap"
+    dryrun=$($alice normal_swap 0.02 dryrun)
+    lightning_amount=$(echo $dryrun| jq -r ".lightning_amount")
+    swap=$($alice normal_swap 0.02 $lightning_amount)
+    echo $swap | jq
+    funding_txid=$(echo $swap| jq -r ".txid")
+    assert_utxo_exists $funding_txid 0
+    new_blocks 1
+    wait_until_spent $funding_txid 0
+    wait_until_htlcs_settled bob
 fi
 
 
@@ -335,15 +385,22 @@ if [[ $1 == "swapserver_forceclose" ]]; then
     new_blocks 1
     wait_until_spent $funding_txid 0 # alice reveals preimage
     new_blocks 1
-    if [ $TEST_ANCHOR_CHANNELS = True ] ; then
+    if [ $TEST_SRK_CHANNELS != True ] ; then  # anchors
         output_index=3  # received_htlc_output in bob's ctx. FIXME index depends on Alice not using MPP
-    else
+    else  # srk
         output_index=1
     fi
     # wait until Bob finds preimage onchain and uses it to create an htlc_success tx
     wait_until_spent $ctx_id $output_index
     new_blocks 144
     wait_for_balance bob 0.999
+    # check that the closing tx is in alice's onchain_history. Since this tx does not
+    # touch alice's wallet addresses, this test requires accounting_addresses to be set
+    $alice stop
+    if [[ ! $($alice -o onchain_history| jq --arg txid $ctx_id '.[]|select(.txid == $txid)') ]]; then
+       echo "accounting_address not set"
+       exit 1
+    fi
 fi
 
 
@@ -412,12 +469,12 @@ if [[ $1 == "lnwatcher_waits_until_fees_go_down" ]]; then
     new_blocks 1
     wait_until_channel_closed alice
     ctx_id=$($alice list_channels | jq -r ".[0].closing_txid")
-    if [ $TEST_ANCHOR_CHANNELS = True ] ; then
+    if [ $TEST_SRK_CHANNELS != True ] ; then  # anchors
         htlc_output_index1=2
         htlc_output_index2=3
         to_alice_index=4  # Bob's to_remote
         wait_until_spent $ctx_id $to_alice_index
-    else
+    else  # srk
         htlc_output_index1=0
         htlc_output_index2=1
         to_alice_index=2
@@ -637,11 +694,7 @@ if [[ $1 == "breach_with_spent_htlc" ]]; then
     fi
     cp /tmp/alice/regtest/wallets/default_wallet /tmp/alice/regtest/wallets/toxic_wallet
     $bob enable_htlc_settle true
-    unsettled=$($alice list_channels | jq '.[] | .local_unsettled_sent')
-    if [[ "$unsettled" != "0" ]]; then
-        echo "enable_htlc_settle did not work, $unsettled"
-        exit 1
-    fi
+    wait_until_htlcs_settled alice
     echo $($bob getbalance)
     echo "bob goes offline"
     $bob stop
@@ -658,16 +711,15 @@ if [[ $1 == "breach_with_spent_htlc" ]]; then
     new_blocks 150
     $alice stop
     $alice daemon -d
-    sleep 1
     $alice load_wallet -w /tmp/alice/regtest/wallets/toxic_wallet
     # wait until alice has spent both ctx outputs
     echo "alice spends to_local and htlc outputs"
-    if [ $TEST_ANCHOR_CHANNELS = True ] ; then
+    if [ $TEST_SRK_CHANNELS != True ] ; then  # anchors
         # to_local_anchor/to_remote_anchor: 0 and 1 (both are present due to untrimmed htlcs)
         # htlc: 2, to_local: 3
         wait_until_spent $ctx_id 2
         wait_until_spent $ctx_id 3
-    else
+    else  # srk
         # htlc: 0, to_local: 1
         wait_until_spent $ctx_id 0
         wait_until_spent $ctx_id 1
@@ -710,9 +762,9 @@ if [[ $1 == "watchtower" ]]; then
     ctx_id=$($bitcoin_cli sendrawtransaction $ctx)
     echo "alice breaches with old ctx:" $ctx_id
     echo "watchtower publishes justice transaction"
-    if [ $TEST_ANCHOR_CHANNELS = True ] ; then
+    if [ $TEST_SRK_CHANNELS != True ] ; then  # anchors
         output_index=3
-    else
+    else  # srk
         output_index=1
     fi
     wait_until_spent $ctx_id $output_index  # alice's to_local gets punished
@@ -743,21 +795,16 @@ if [[ $1 == "fw_fail_htlc" ]]; then
     sleep 1
     new_blocks 150 # cltv before bob can broadcast
     # index of htlc
-    if [ $TEST_ANCHOR_CHANNELS = True ] ; then
+    if [ $TEST_SRK_CHANNELS != True ] ; then  # anchors
         output_index=2
-    else
+    else  # srk
         output_index=0
     fi
     wait_until_spent $ctx_id $output_index
     new_blocks 1   # confirm 2nd stage.
     sleep 1
-    new_blocks 100 # deep
-    sleep 5        # give bob time to fail incoming htlc
-    unsettled=$($alice list_channels | jq '.[] | .local_unsettled_sent')
-    if [[ "$unsettled" != "0" ]]; then
-        echo 'alice htlc was not failed'
-        exit 1
-    fi
+    new_blocks 100 # deep enough for is_deeply_mined (>20 confs)
+    wait_until_htlcs_settled alice  # bob propagates the failure back once the HTLC-timeout tx is deeply mined
 fi
 
 if [[ $1 == "just_in_time" ]]; then
@@ -772,7 +819,26 @@ if [[ $1 == "just_in_time" ]]; then
     echo "carol pays alice"
     # note: set amount to 0.001 to test failure: 'payment too low'
     invoice=$($alice add_request 0.01 --lightning --memo "invoice" | jq -r ".lightning_invoice")
-    $carol lnpay $invoice
+    success=$($carol lnpay $invoice | jq -r ".success")
+    if [[ "$success" != "true" ]]; then
+        echo "jit payment failed"
+        exit 1
+    fi
+    # try again, multiple jit openings should work without issues
+    new_blocks 3
+    wait_for_chain_tip bob
+    echo "carol pays alice again"
+    invoice=$($alice add_request 0.04 --lightning --memo "invoice2" | jq -r ".lightning_invoice")
+    success=$($carol lnpay $invoice | jq -r ".success")
+    if [[ "$success" != "true" ]]; then
+        echo "jit payment failed"
+        exit 1
+    fi
+    alice_chan_count=$($alice list_channels | jq '. | length')
+    if [[ "$alice_chan_count" != "2" ]]; then
+        echo "alice should have two jit channels"
+        exit 1
+    fi
 fi
 
 if [[ $1 == "unixsockets" ]]; then

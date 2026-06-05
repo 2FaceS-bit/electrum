@@ -45,7 +45,7 @@
 #
 # 1. CPFP:
 # When a batch is forgotten but not mined (because the server returned an error), we no longer bump its fee.
-# However, the current code does not theat the next batch as a CPFP when computing the fee.
+# However, the current code does not treat the next batch as a CPFP when computing the fee.
 #
 # 2. Reorgs:
 # This code does not guarantee that a payment or a sweep will happen.
@@ -56,6 +56,13 @@
 # In the case of sweeps, lnwatcher ensures that SweepInfo is added again after a client restart.
 # In order to generalize that logic to payments, callers would need to pass a unique ID along with
 # the payment output, so that we can prevent paying twice.
+#
+# - nLocktime/CLTV values (bip-65) and nSequence/CSV values (bip-112) are either explicitly
+#   or implicitly block-height-based everywhere in this file.
+#   SCRIPT execution fails on height vs timestamp confusion, and
+#   it is not safe to do naive integer comparison between these values without establishing type.
+#   TODO review this is correct, and add checks.
+#    nLocktime/CLTV usage in particular seems dangerously *implicit* for being block-heights
 
 import asyncio
 import threading
@@ -322,13 +329,28 @@ class TxBatch(Logger):
         for prevout, sweep_info in list(self.batch_inputs.items()):
             assert prevout == sweep_info.txin.prevout
             prev_txid, index = prevout.to_str().split(':')
-            if not self.wallet.adb.db.get_transaction(prev_txid):
+            if not (prev_tx := self.wallet.adb.db.get_transaction(prev_txid)):
                 continue
             if sweep_info.is_anchor():
                 prev_tx_mined_status = self.wallet.adb.get_tx_height(prev_txid)
                 if prev_tx_mined_status.conf > 0:
                     self.logger.info(f"anchor not needed {prevout}")
                     self.batch_inputs.pop(prevout)  # note: if the input is already in a batch tx, this will trigger assert error
+                    continue
+                prev_tx_current_fee = self.wallet.adb.get_tx_fee(prev_txid)
+                try:
+                    prev_tx_target_fee = self.fee_policy.estimate_fee(
+                        prev_tx.estimated_size(),
+                        network=self.wallet.network,
+                    )
+                except NoDynamicFeeEstimates:
+                    prev_tx_target_fee = None
+                fees_available = prev_tx_current_fee and prev_tx_target_fee
+                if fees_available and prev_tx_current_fee > prev_tx_target_fee:
+                    self.logger.info(
+                        f"not using anchor now, fee sufficient: "
+                        f"{prev_tx_current_fee=} > {prev_tx_target_fee=}", only_once=True,
+                    )
                     continue
             if spender_txid := self.wallet.adb.db.get_spent_outpoint(prev_txid, int(index)):
                 tx_mined_status = self.wallet.adb.get_tx_height(spender_txid)
@@ -517,7 +539,7 @@ class TxBatch(Logger):
         # sort inputs so that txin-txout pairs are first
         for sweep_info in sorted(to_sweep, key=lambda x: not bool(x.txout)):
             if sweep_info.cltv_abs is not None:
-                if locktime is None or locktime < sweep_info.cltv_abs:
+                if locktime is None or locktime < sweep_info.cltv_abs:  # FIXME height vs timestamp confusion
                     # nLockTime must be greater than or equal to the stack operand.
                     locktime = sweep_info.cltv_abs
             inputs.append(copy.deepcopy(sweep_info.txin))

@@ -1,11 +1,18 @@
+import asyncio
+from collections import defaultdict
 import os
 from typing import Optional, Iterable
+from unittest import mock
 
 from electrum.commands import Commands
 from electrum.daemon import Daemon
 from electrum.simple_config import SimpleConfig
 from electrum.wallet import Abstract_Wallet
+from electrum.lnworker import LNWallet, LNPeerManager
+from electrum.lnwatcher import LNWatcher
 from electrum import util
+from electrum.utils.memory_leak import count_objects_in_memory
+from electrum import constants
 
 from . import ElectrumTestCase, as_testnet, restore_wallet_from_text__for_unittest
 
@@ -30,7 +37,7 @@ class DaemonTestCase(ElectrumTestCase):
         await self.daemon.stop()
         await super().asyncTearDown()
 
-    def _restore_wallet_from_text(self, text, *, password: Optional[str], encrypt_file: bool = None) -> str:
+    def _restore_wallet_from_text(self, text, *, password: Optional[str], encrypt_file: bool = None, **kwargs) -> str:
         """Returns path for created wallet."""
         basename = util.get_new_wallet_name(self.wallet_dir)
         path = os.path.join(self.wallet_dir, basename)
@@ -40,6 +47,7 @@ class DaemonTestCase(ElectrumTestCase):
             password=password,
             encrypt_file=encrypt_file,
             config=self.config,
+            **kwargs,
         )
         # We return the path instead of the wallet object, as extreme
         # care would be needed to use the wallet object directly:
@@ -52,7 +60,7 @@ class TestUnifiedPassword(DaemonTestCase):
 
     def setUp(self):
         super().setUp()
-        self.config.WALLET_USE_SINGLE_PASSWORD = True
+        self.config.WALLET_SHOULD_USE_SINGLE_PASSWORD = True
 
     def _run_post_unif_sanity_checks(self, paths: Iterable[str], *, password: str):
         for path in paths:
@@ -64,8 +72,11 @@ class TestUnifiedPassword(DaemonTestCase):
                 self.assertTrue(w.has_keystore_encryption())
             if w.has_seed():
                 self.assertIsInstance(w.get_seed(password), str)
-        can_be_unified, is_unified = self.daemon._check_password_for_directory(old_password=password, wallet_dir=self.wallet_dir)
-        self.assertEqual((True, True), (can_be_unified, is_unified))
+        can_be_unified, is_unified, wallet_paths_can_unlock = self.daemon.check_password_for_directory(
+            old_password=password,
+            wallet_dir=self.wallet_dir,
+        )
+        self.assertEqual((True, True, len(paths)), (can_be_unified, is_unified, len(wallet_paths_can_unlock)))
 
     # "cannot unify pw" tests --->
 
@@ -77,7 +88,7 @@ class TestUnifiedPassword(DaemonTestCase):
         with open(path2, "rb") as f:
             raw2_before = f.read()
 
-        can_be_unified, is_unified = self.daemon._check_password_for_directory(old_password="123456", wallet_dir=self.wallet_dir)
+        can_be_unified, is_unified, _ = self.daemon.check_password_for_directory(old_password="123456", wallet_dir=self.wallet_dir)
         self.assertEqual((False, False), (can_be_unified, is_unified))
         is_unified = self.daemon.update_password_for_directory(old_password="123456", new_password="123456")
         self.assertFalse(is_unified)
@@ -100,7 +111,7 @@ class TestUnifiedPassword(DaemonTestCase):
         with open(path3, "rb") as f:
             raw3_before = f.read()
 
-        can_be_unified, is_unified = self.daemon._check_password_for_directory(old_password="123456", wallet_dir=self.wallet_dir)
+        can_be_unified, is_unified, _ = self.daemon.check_password_for_directory(old_password="123456", wallet_dir=self.wallet_dir)
         self.assertEqual((False, False), (can_be_unified, is_unified))
         is_unified = self.daemon.update_password_for_directory(old_password="123456", new_password="123456")
         self.assertFalse(is_unified)
@@ -120,7 +131,7 @@ class TestUnifiedPassword(DaemonTestCase):
     async def test_can_unify_two_std_wallets_both_have_ks_and_sto_enc(self):
         path1 = self._restore_wallet_from_text("9dk", password="123456", encrypt_file=True)
         path2 = self._restore_wallet_from_text("x8",  password="123456", encrypt_file=True)
-        can_be_unified, is_unified = self.daemon._check_password_for_directory(old_password="123456", wallet_dir=self.wallet_dir)
+        can_be_unified, is_unified, _ = self.daemon.check_password_for_directory(old_password="123456", wallet_dir=self.wallet_dir)
         self.assertEqual((True, True), (can_be_unified, is_unified))
         is_unified = self.daemon.update_password_for_directory(old_password="123456", new_password="123456")
         self.assertTrue(is_unified)
@@ -132,7 +143,7 @@ class TestUnifiedPassword(DaemonTestCase):
         with open(path2, "rb") as f:
             raw2_before = f.read()
 
-        can_be_unified, is_unified = self.daemon._check_password_for_directory(old_password="123456", wallet_dir=self.wallet_dir)
+        can_be_unified, is_unified, _ = self.daemon.check_password_for_directory(old_password="123456", wallet_dir=self.wallet_dir)
         self.assertEqual((True, False), (can_be_unified, is_unified))
         is_unified = self.daemon.update_password_for_directory(old_password="123456", new_password="123456")
         self.assertTrue(is_unified)
@@ -145,7 +156,7 @@ class TestUnifiedPassword(DaemonTestCase):
     async def test_can_unify_two_std_wallets_one_without_password(self):
         path1 = self._restore_wallet_from_text("9dk", password=None)
         path2 = self._restore_wallet_from_text("x8",  password="123456", encrypt_file=True)
-        can_be_unified, is_unified = self.daemon._check_password_for_directory(old_password="123456", wallet_dir=self.wallet_dir)
+        can_be_unified, is_unified, _ = self.daemon.check_password_for_directory(old_password="123456", wallet_dir=self.wallet_dir)
         self.assertEqual((True, False), (can_be_unified, is_unified))
         is_unified = self.daemon.update_password_for_directory(old_password="123456", new_password="123456")
         self.assertTrue(is_unified)
@@ -179,11 +190,45 @@ class TestUnifiedPassword(DaemonTestCase):
         paths.append(self._restore_wallet_from_text(addrs, password="123456", encrypt_file=False))
         paths.append(self._restore_wallet_from_text(addrs, password=None))
         # do unification
-        can_be_unified, is_unified = self.daemon._check_password_for_directory(old_password="123456", wallet_dir=self.wallet_dir)
+        can_be_unified, is_unified, _ = self.daemon.check_password_for_directory(old_password="123456", wallet_dir=self.wallet_dir)
         self.assertEqual((True, False), (can_be_unified, is_unified))
         is_unified = self.daemon.update_password_for_directory(old_password="123456", new_password="123456")
         self.assertTrue(is_unified)
         self._run_post_unif_sanity_checks(paths, password="123456")
+
+    # misc --->
+
+    async def test_wallet_objects_are_properly_garbage_collected_after_check_pw_for_dir(self):
+        orig_cb_count = util.callback_mgr.count_all_callbacks()
+        # GC sanity-check:
+        mclasses = [Abstract_Wallet, LNWallet, LNWatcher, LNPeerManager]
+        objmap = count_objects_in_memory(mclasses)
+        for mcls in mclasses:
+            self.assertEqual(len(objmap[mcls]), 0, msg=f"too many lingering objs of type={mcls}")
+        # restore some wallets
+        paths = []
+        paths.append(self._restore_wallet_from_text("9dk", password="123456", encrypt_file=True))
+        paths.append(self._restore_wallet_from_text("9dk", password="123456", encrypt_file=False))
+        paths.append(self._restore_wallet_from_text("9dk", password=None))
+        paths.append(self._restore_wallet_from_text("9dk", password="123456", encrypt_file=True, passphrase="hunter2"))
+        paths.append(self._restore_wallet_from_text("9dk", password="999999", encrypt_file=False, passphrase="hunter2"))
+        paths.append(self._restore_wallet_from_text("9dk", password=None, passphrase="hunter2"))
+        # test unification
+        can_be_unified, is_unified, paths_succeeded = self.daemon.check_password_for_directory(old_password="123456", wallet_dir=self.wallet_dir)
+        self.assertEqual((False, False, 5), (can_be_unified, is_unified, len(paths_succeeded)))
+        # gc
+        try:
+            async with util.async_timeout(5):
+                while True:
+                    objmap = count_objects_in_memory(mclasses)
+                    if sum(len(lst) for lst in objmap.values()) == 0:
+                        break  # all "mclasses"-type objects have been GC-ed
+                    await asyncio.sleep(0.01)
+        except asyncio.TimeoutError:
+            for mcls in mclasses:
+                self.assertEqual(len(objmap[mcls]), 0, msg=f"too many lingering objs of type={mcls}")
+        # also check callbacks have been cleaned up:
+        self.assertEqual(orig_cb_count, util.callback_mgr.count_all_callbacks())
 
 
 class TestCommandsWithDaemon(DaemonTestCase):
@@ -304,3 +349,27 @@ class TestLoadWallet(DaemonTestCase):
         wallet1 = self.daemon.load_wallet(path1, password="garbage")
         with self.assertRaises(util.InvalidPassword):
             wallet1 = self.daemon.load_wallet(path1, password="garbage", force_check_password=True)
+
+    async def test_mainnet_testnet_mixup(self):
+        """version bytes in addresses, xpubs, etc. differ between mainnet and testnet.
+        If the user tries to open a wallet for a different chain, try to show a reasonable error message.
+        """
+        # we are on mainnet, and will try to open testnet wallets:
+        assert constants.net.TESTNET is False
+
+        # case 1: fresh wallet created on wrong network
+        with mock.patch("electrum.constants.net", constants.BitcoinTestnet):
+            path = self._restore_wallet_from_text("9dk", password=None)
+        with self.assertRaises(util.WalletFileException):
+            wallet = self.daemon.load_wallet(path, password=None, upgrade=True)
+
+        # case 2: existing older wallet (db v57) that gets populated with 'genesis_blockhash' in convert_version_71
+        path = self.get_wallet_file_path("client_4_5_2_9dk_with_ln")
+        with self.assertRaises(util.WalletFileException):
+            wallet = self.daemon.load_wallet(path, password=None, upgrade=True)
+
+        # case 3: existing older wallet (db v18) that gets populated with 'genesis_blockhash' in convert_version_71
+        # // this test does not work:  convert_version_20 raises InvalidMasterKeyVersionBytes
+        # path = self.get_wallet_file_path("client_3_3_8_xpub_with_realistic_history")
+        # with self.assertRaises(util.WalletFileException):
+        #     wallet = self.daemon.load_wallet(path, password=None, upgrade=True)

@@ -1,6 +1,6 @@
 from typing import Optional
 
-from PyQt6.QtCore import pyqtProperty, pyqtSignal, pyqtSlot, QObject
+from PyQt6.QtCore import pyqtProperty, pyqtSignal, pyqtSlot, QObject, QVariant
 
 from electrum.i18n import _
 from electrum.logging import get_logger
@@ -12,9 +12,10 @@ from electrum.address_synchronizer import TX_HEIGHT_UNCONF_PARENT, TX_HEIGHT_UNC
 from electrum.wallet import TxSighashDanger
 from electrum.fee_policy import FeePolicy
 
+from electrum.gui.common_qt.util import QtEventListener, qt_event_listener
+
 from .qewallet import QEWallet
 from .qetypes import QEAmount
-from .util import QtEventListener, qt_event_listener
 
 
 class QETxDetails(QObject, QtEventListener):
@@ -102,12 +103,13 @@ class QETxDetails(QObject, QtEventListener):
         self.update()
 
     walletChanged = pyqtSignal()
-    @pyqtProperty(QEWallet, notify=walletChanged)
-    def wallet(self):
+    @pyqtProperty(QVariant, notify=walletChanged)
+    def wallet(self) -> QEWallet:
         return self._wallet
 
     @wallet.setter
     def wallet(self, wallet: QEWallet):
+        assert wallet is None or isinstance(wallet, QEWallet)
         if self._wallet != wallet:
             self._wallet = wallet
             self.walletChanged.emit()

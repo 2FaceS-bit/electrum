@@ -2,25 +2,29 @@
 # Distributed under the MIT software license, see the accompanying
 # file LICENCE or http://www.opensource.org/licenses/mit-license.php
 
+import asyncio
 from typing import TYPE_CHECKING, Optional, Dict, Callable, Awaitable
 
 from . import util
-from .util import TxMinedInfo, BelowDustLimit, NoDynamicFeeEstimates
-from .util import EventListener, event_listener, log_exceptions, ignore_exceptions
+from .util import (
+    TxMinedInfo, BelowDustLimit, NoDynamicFeeEstimates, OldTaskGroup, EventListener, event_listener, log_exceptions,
+    ignore_exceptions, now
+)
 from .transaction import Transaction, TxOutpoint
 from .logging import Logger
 from .address_synchronizer import TX_HEIGHT_LOCAL
 from .lnutil import REDEEM_AFTER_DOUBLE_SPENT_DELAY
-
+from .lnsweep import KeepWatchingTXO, SweepInfo
 
 if TYPE_CHECKING:
     from .network import Network
-    from .lnsweep import SweepInfo
     from .lnworker import LNWallet
     from .lnchannel import AbstractChannel
 
 
 class LNWatcher(Logger, EventListener):
+    MAX_CALLBACK_TRIGGER_DELAY_SEC = 600
+    CALLBACK_LOOP_POLL_INTERVAL_SEC = 5
 
     def __init__(self, lnworker: 'LNWallet'):
         self.lnworker = lnworker
@@ -31,12 +35,42 @@ class LNWatcher(Logger, EventListener):
         self.network = None
         self.register_callbacks()
         self._pending_force_closes = set()
+        self.taskgroup = OldTaskGroup()
+        self._last_callback_trigger_ts = 0
 
     def start_network(self, network: 'Network'):
+        assert not self.network, "already started?"
         self.network = network
+        asyncio.run_coroutine_threadsafe(self._main_loop(), util.get_asyncio_loop())
 
-    def stop(self):
+    async def stop(self):
+        await self.taskgroup.cancel_remaining()
         self.unregister_callbacks()
+
+    async def _main_loop(self):
+        self.logger.debug("starting taskgroup")
+        try:
+            async with self.taskgroup as group:
+                await group.spawn(self._callback_loop())  # keeps group alive
+        except Exception:
+            self.logger.exception("taskgroup crashed")
+        finally:
+            self.logger.debug("taskgroup stopped")
+
+    async def _callback_loop(self):
+        """
+        Triggers the callbacks if no event has triggered them within the
+        last MAX_CALLBACK_TRIGGER_DELAY_SEC (e.g. during a prolonged time without new blocks)
+        """
+        ts_start = now()
+        while True:
+            max_delay = self.MAX_CALLBACK_TRIGGER_DELAY_SEC
+            if now() - ts_start < max_delay:
+                max_delay /= 10  # if wallet just recently opened, be much more eager
+            time_since_last_cb_trigger = now() - self._last_callback_trigger_ts
+            if time_since_last_cb_trigger > max_delay:
+                await self.trigger_callbacks()
+            await asyncio.sleep(self.CALLBACK_LOOP_POLL_INTERVAL_SEC)
 
     def remove_callback(self, address: str) -> None:
         self.callbacks.pop(address, None)
@@ -49,12 +83,18 @@ class LNWatcher(Logger, EventListener):
         subscribe: bool = True,
     ) -> None:
         if subscribe:
+            # FIXME even when called with subscribe=False, adb likely already has this address.
+            #   wallet.adb==lnwatcher.adb, and adb.db==wallet.db, which is persisted to disk.
+            #   A call to adb.add_address at any time will add the address to the persistent DB.
+            #   So in practice adb has the channel-related and swap-related addresses we *ever*
+            #   subscribed to, and will have adb.synchronizer sub to them again.
+            #   (even for old redeemed channels and old swaps)
             self.adb.add_address(address)
         self.callbacks[address] = callback
 
     async def trigger_callbacks(self, *, requires_synchronizer: bool = True):
         if requires_synchronizer and not self.adb.synchronizer:
-            self.logger.info("synchronizer not set yet")
+            self.logger.debug("synchronizer not set yet")
             return
         for address, callback in list(self.callbacks.items()):
             try:
@@ -63,6 +103,7 @@ class LNWatcher(Logger, EventListener):
                 self.logger.exception(f"LNWatcher callback failed {address=}")
         # send callback to GUI
         util.trigger_callback('wallet_updated', self.lnworker.wallet)
+        self._last_callback_trigger_ts = now()
 
     @event_listener
     async def on_event_blockchain_updated(self, *args):
@@ -106,9 +147,12 @@ class LNWatcher(Logger, EventListener):
         closing_txid = self.adb.get_spender(funding_outpoint)
         closing_height = self.adb.get_tx_height(closing_txid)
         if closing_txid:
+            self.adb.subscribe_to_outputs(closing_txid)
             closing_tx = self.adb.get_transaction(closing_txid)
             if closing_tx:
                 keep_watching = await self.sweep_commitment_transaction(funding_outpoint, closing_tx)
+                if not keep_watching:
+                    self.remove_callback(address)
             else:
                 self.logger.info(f"channel {funding_outpoint} closed by {closing_txid}. still waiting for tx itself...")
                 keep_watching = True
@@ -157,9 +201,7 @@ class LNWatcher(Logger, EventListener):
         chan = self.lnworker.channel_by_txo(funding_outpoint)
         if not chan:
             return False
-        if not chan.need_to_subscribe():
-            return False
-        self.logger.info(f'sweep_commitment_transaction {funding_outpoint}')
+        local_height = self.adb.get_local_height()
         # detect who closed and get information about how to claim outputs
         is_local_ctx, sweep_info_dict = chan.get_ctx_sweep_info(closing_tx)
         # note: we need to keep watching *at least* until the closing tx is deeply mined,
@@ -170,6 +212,10 @@ class LNWatcher(Logger, EventListener):
             prev_txid, prev_index = prevout.split(':')
             name = sweep_info.name + ' ' + chan.get_id_for_log()
             self.lnworker.wallet.set_default_label(prevout, name)
+            if isinstance(sweep_info, KeepWatchingTXO):  # haven't yet decided if we want to sweep
+                keep_watching |= sweep_info.until_height > local_height
+                continue
+            assert isinstance(sweep_info, SweepInfo), sweep_info
             if not self.adb.get_transaction(prev_txid):
                 # do not keep watching if prevout does not exist
                 self.logger.info(f'prevout does not exist for {name}: {prevout}')
@@ -180,10 +226,16 @@ class LNWatcher(Logger, EventListener):
             if spender_tx:
                 # the spender might be the remote, revoked or not
                 htlc_sweepinfo = chan.maybe_sweep_htlcs(closing_tx, spender_tx)
+                if htlc_sweepinfo:
+                    self.adb.subscribe_to_outputs(spender_txid)
                 for prevout2, htlc_sweep_info in htlc_sweepinfo.items():
+                    self.lnworker.wallet.set_default_label(prevout2, htlc_sweep_info.name)
+                    if isinstance(htlc_sweep_info, KeepWatchingTXO):  # haven't yet decided if we want to sweep
+                        keep_watching |= htlc_sweep_info.until_height > local_height
+                        continue
+                    assert isinstance(htlc_sweep_info, SweepInfo), htlc_sweep_info
                     watch_htlc_sweep_info = self.maybe_redeem(htlc_sweep_info)
                     htlc_tx_spender = self.adb.get_spender(prevout2)
-                    self.lnworker.wallet.set_default_label(prevout2, htlc_sweep_info.name)
                     if htlc_tx_spender:
                         keep_watching |= not self.adb.is_deeply_mined(htlc_tx_spender)
                         self.maybe_add_accounting_address(htlc_tx_spender, htlc_sweep_info)

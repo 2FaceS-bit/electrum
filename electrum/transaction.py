@@ -36,6 +36,7 @@ from enum import IntEnum
 import itertools
 import binascii
 import copy
+import re
 
 import electrum_ecc as ecc
 from electrum_ecc.util import bip340_tagged_hash
@@ -51,7 +52,7 @@ from .bitcoin import (
 from .crypto import sha256d, sha256
 from .logging import get_logger
 from .util import ShortID, OldTaskGroup
-from .descriptor import Descriptor, MissingSolutionPiece, create_dummy_descriptor_from_address
+from .descriptor import Descriptor, MissingSolutionPiece, create_dummy_descriptor_from_address, DUMMY_DER_SIG
 
 if TYPE_CHECKING:
     from .wallet import Abstract_Wallet
@@ -349,16 +350,18 @@ class TxInput:
 
     def get_time_based_relative_locktime(self) -> Optional[int]:
         # see bip 68
-        if self.nsequence & (1<<31):
-            return
-        if self.nsequence & (1<<22):
+        if self.nsequence & (1<<31):  # "disable" flag
+            return None
+        if self.nsequence & (1<<22):  # in units of 512 sec
             return self.nsequence & 0xffff
+        return None
 
     def get_block_based_relative_locktime(self) -> Optional[int]:
-        if self.nsequence & (1<<31):
-            return
-        if not self.nsequence & (1<<22):
+        if self.nsequence & (1<<31):  # "disable" flag
+            return None
+        if not self.nsequence & (1<<22):  # in blocks
             return self.nsequence & 0xffff
+        return None
 
     @property
     def short_id(self):
@@ -377,7 +380,7 @@ class TxInput:
             return
         # note that tx might be a PartialTransaction
         # serialize and de-serialize tx now. this might e.g. convert a complete PartialTx to a Tx
-        tx = tx_from_any(str(tx))
+        tx = tx_from_any(str(tx), sanitize=False)
         # 'utxo' field should not be a PSBT:
         if not tx.is_complete():
             return
@@ -1005,8 +1008,7 @@ class Transaction:
             return construct_witness([])
 
         if estimate_size and hasattr(txin, 'make_witness'):
-            sig_dummy = b'\x00' * 71  # DER-encoded ECDSA sig, with low S and low R
-            txin.witness_sizehint = len(txin.make_witness(sig_dummy))
+            txin.witness_sizehint = len(txin.make_witness(DUMMY_DER_SIG))
 
         if estimate_size and txin.witness_sizehint is not None:
             return bytes(txin.witness_sizehint)
@@ -1267,6 +1269,7 @@ class Transaction:
         timeout=None,
     ) -> None:
         """note: it is recommended to call add_info_from_wallet first, as this can save some network requests"""
+        from .interface import NetworkException
         if not self.is_missing_info_from_network():
             return
         if progress_cb is None:
@@ -1300,6 +1303,8 @@ class Transaction:
         except Exception as e:
             has_errored = True
             _logger.error(f"tx.add_info_from_network() got exc: {e!r}")
+            if isinstance(e, NetworkException) and not ignore_network_issues:
+                raise
         finally:
             has_finished = True
             progress_cb(TxinDataFetchProgress(num_tasks_done, num_tasks_total, has_errored, has_finished))
@@ -1328,13 +1333,13 @@ class Transaction:
 
     def get_time_based_relative_locktime(self) -> Optional[int]:
         if self.version < 2:
-            return
+            return None
         locktimes = list(filter(None, [txin.get_time_based_relative_locktime() for txin in self.inputs()]))
         return max(locktimes) if locktimes else None
 
     def get_block_based_relative_locktime(self) -> Optional[int]:
         if self.version < 2:
-            return
+            return None
         locktimes = list(filter(None, [txin.get_block_based_relative_locktime() for txin in self.inputs()]))
         return max(locktimes) if locktimes else None
 
@@ -1342,12 +1347,22 @@ class Transaction:
         """Whether the tx explicitly signals BIP-0125 replace-by-fee."""
         return any([txin.nsequence < 0xffffffff - 1 for txin in self.inputs()])
 
+    def is_coinbase_tx(self) -> bool:
+        return self.inputs()[0].is_coinbase_input()
+
     def estimated_size(self) -> int:
         """Return an estimated virtual tx size in vbytes.
         BIP-0141 defines 'Virtual transaction size' to be weight/4 rounded up.
         This definition is only for humans, and has little meaning otherwise.
         If we wanted sub-byte precision, fee calculation should use transaction
-        weights, but for simplicity we approximate that with (virtual_size)x4
+        weights, but for simplicity we approximate that with (virtual_size)x4.
+        note: while we try to estimate as close to the true value as possible,
+            whenever that's not possible, we should over-estimate. E.g. ecdsa DER sig
+            sizes can be 71 or 72 bytes (even 73 though that is non-standard).
+            Over-estimating is preferred as the typical use-case is the user selecting
+            a target_feerate, and the code calculating abs fees as target_feerate*est_size.
+            If we over-estimate est_size there, that means the final true_feerate is going to
+            be higher than target_feerate, which is desirable especially near the min_relay_fee.
         """
         weight = self.estimated_weight()
         return self.virtual_size_from_weight(weight)
@@ -1479,8 +1494,6 @@ def convert_raw_tx_to_hex(raw: Union[str, bytes]) -> str:
     raw tx hex string."""
     if not raw:
         raise ValueError("empty string")
-    raw_unstripped = raw
-    raw = raw.strip()
     # try hex
     try:
         return binascii.unhexlify(raw).hex()
@@ -1497,16 +1510,28 @@ def convert_raw_tx_to_hex(raw: Union[str, bytes]) -> str:
             return base64.b64decode(raw, validate=True).hex()
         except Exception:
             pass
-    # raw bytes (do not strip whitespaces in this case)
-    if isinstance(raw_unstripped, bytes):
-        return raw_unstripped.hex()
+    # raw bytes
+    if isinstance(raw, (bytes, bytearray)):
+        return raw.hex()
     raise ValueError(f"failed to recognize transaction encoding for txt: {raw[:30]}...")
 
 
-def tx_from_any(raw: Union[str, bytes], *,
-                deserialize: bool = True) -> Union['PartialTransaction', 'Transaction']:
-    if isinstance(raw, bytearray):
-        raw = bytes(raw)
+def tx_from_any(
+        raw: Union[str, bytes], *,
+        deserialize: bool = True,
+        sanitize: bool = True,
+) -> Union['PartialTransaction', 'Transaction']:
+    # re.sub is expensive, set sanitize to False if raw data is not from user input
+    if isinstance(raw, str) and sanitize:
+        # remove all whitespace characters, anywhere, for convenience
+        # - leading/trailing whitespaces are quite common for user-input
+        # - newlines in the middle can also happen, e.g. when copying a raw tx from a pdf
+        # note: we don't do this for bytes-like inputs, as whitespace-looking bytes can appear
+        #       anywhere in a raw tx. Even leading/trailing pseudo-whitespace: consider that
+        #       the nVersion or the nLocktime might contain e.g. "0a" bytes
+        #       consider:  "\n".encode().hex() == "0a"
+        #       For str, this is a non-issue and safe to do.
+        raw = re.sub(r'\s', '', raw)
     raw = convert_raw_tx_to_hex(raw)
     try:
         return PartialTransaction.from_raw_psbt(raw)
@@ -1522,7 +1547,7 @@ def tx_from_any(raw: Union[str, bytes], *,
         return tx
     except Exception as e:
         raise SerializationError(f"Failed to recognise tx encoding, or to parse transaction. "
-                                 f"raw: {raw[:30]}...") from e
+                                 f"raw: {raw[:30]!r}...") from e
 
 
 class PSBTGlobalType(IntEnum):
@@ -2200,9 +2225,9 @@ class PartialTransaction(Transaction):
         return res
 
     @classmethod
-    def from_raw_psbt(cls, raw) -> 'PartialTransaction':
+    def from_raw_psbt(cls, raw: Union[str, bytes, bytearray]) -> 'PartialTransaction':
         # auto-detect and decode Base64 and Hex.
-        if raw[0:10].lower() in (b'70736274ff', '70736274ff'):  # hex
+        if raw[0:10].lower() == '70736274ff':  # hex (str)
             raw = bytes.fromhex(raw)
         elif raw[0:6] in (b'cHNidP', 'cHNidP'):  # base64
             raw = base64.b64decode(raw, validate=True)

@@ -75,9 +75,9 @@ ca_path = certifi.where()
 
 BUCKET_NAME_OF_ONION_SERVERS = 'onion'
 
-_KNOWN_NETWORK_PROTOCOLS = {'t', 's'}
+KNOWN_ELEC_PROTOCOL_TRANSPORTS = {'t', 's'}
 PREFERRED_NETWORK_PROTOCOL = 's'
-assert PREFERRED_NETWORK_PROTOCOL in _KNOWN_NETWORK_PROTOCOLS
+assert PREFERRED_NETWORK_PROTOCOL in KNOWN_ELEC_PROTOCOL_TRANSPORTS
 
 MAX_NUM_HEADERS_PER_REQUEST = 2016
 assert MAX_NUM_HEADERS_PER_REQUEST >= CHUNK_SIZE
@@ -169,6 +169,10 @@ class NotificationSession(RPCSession):
         self.interface = interface
         self.taskgroup = interface.taskgroup
         self.cost_hard_limit = 0  # disable aiorpcx resource limits
+
+        # To log pre-processed json traffic, uncomment:
+        #self.logger.setLevel(logging.DEBUG)  # from aiorpcx
+        #self.verbosity = 4
 
     async def handle_request(self, request):
         self.maybe_log(f"--> {request}")
@@ -462,7 +466,7 @@ class ServerAddr:
             net_addr = NetAddress(host, port)  # this validates host and port
         except Exception as e:
             raise ValueError(f"cannot construct ServerAddr: invalid host or port (host={host}, port={port})") from e
-        if protocol not in _KNOWN_NETWORK_PROTOCOLS:
+        if protocol not in KNOWN_ELEC_PROTOCOL_TRANSPORTS:
             raise ValueError(f"invalid network protocol: {protocol}")
         self.host = str(net_addr.host)  # canonical form (if e.g. IPv6 address)
         self.port = int(net_addr.port)
@@ -1560,12 +1564,15 @@ class Interface(Logger):
         # check response
         if not res:  # ignore empty string
             return ''
-        if not bitcoin.is_address(res):
+        if not isinstance(res, str):
+            raise RequestCorrupted(f'{res!r} should be a str')
+        address = res.removeprefix('bitcoin:')
+        if not bitcoin.is_address(address):
             # note: do not hard-fail -- allow server to use future-type
             #       bitcoin address we do not recognize
             self.logger.info(f"invalid donation address from server: {repr(res)}")
-            res = ''
-        return res
+            return ''
+        return address
 
     async def get_relay_fee(self) -> int:
         """Returns the min relay feerate in sat/kbyte."""
@@ -1802,45 +1809,3 @@ def sanitize_tx_broadcast_response(server_msg) -> str:
             return msg if msg else substring
     # otherwise:
     return _("Unknown error")
-
-
-def check_cert(host, cert):
-    try:
-        b = pem.dePem(cert, 'CERTIFICATE')
-        x = x509.X509(b)
-    except Exception:
-        traceback.print_exc(file=sys.stdout)
-        return
-
-    try:
-        x.check_date()
-        expired = False
-    except Exception:
-        expired = True
-
-    m = "host: %s\n"%host
-    m += "has_expired: %s\n"% expired
-    util.print_msg(m)
-
-
-# Used by tests
-def _match_hostname(name, val):
-    if val == name:
-        return True
-
-    return val.startswith('*.') and name.endswith(val[1:])
-
-
-def test_certificates():
-    from .simple_config import SimpleConfig
-    config = SimpleConfig()
-    mydir = os.path.join(config.path, "certs")
-    certs = os.listdir(mydir)
-    for c in certs:
-        p = os.path.join(mydir,c)
-        with open(p, encoding='utf-8') as f:
-            cert = f.read()
-        check_cert(c, cert)
-
-if __name__ == "__main__":
-    test_certificates()

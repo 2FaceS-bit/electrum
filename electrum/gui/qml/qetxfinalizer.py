@@ -5,22 +5,26 @@ from decimal import Decimal
 from typing import Optional, TYPE_CHECKING, Callable
 from functools import partial
 
-from PyQt6.QtCore import pyqtProperty, pyqtSignal, pyqtSlot, QObject, pyqtEnum
+from PyQt6.QtCore import pyqtProperty, pyqtSignal, pyqtSlot, QObject, pyqtEnum, QVariant
 
 from electrum.logging import get_logger
 from electrum.i18n import _
 from electrum.bitcoin import DummyAddress
 from electrum.transaction import PartialTxOutput, PartialTransaction, Transaction, TxOutpoint
-from electrum.util import NotEnoughFunds, profiler, quantize_feerate, UserFacingException
+from electrum.util import (
+    NotEnoughFunds, profiler, quantize_feerate, UserFacingException, NoDynamicFeeEstimates, event_listener
+)
 from electrum.wallet import CannotBumpFee, CannotDoubleSpendTx, CannotCPFP, BumpFeeStrategy, sweep_preparations
 from electrum import keystore
 from electrum.plugin import run_hook
 from electrum.fee_policy import FeePolicy, FeeMethod
 from electrum.network import NetworkException
 
+from electrum.gui import messages
+from electrum.gui.common_qt.util import QtEventListener
+
 from .qewallet import QEWallet
 from .qetypes import QEAmount
-from .util import QtEventListener, event_listener
 
 if TYPE_CHECKING:
     from electrum.simple_config import SimpleConfig
@@ -33,12 +37,14 @@ class FeeSlider(QObject):
         FEERATE = 0
         ETA = 1
         MEMPOOL = 2
+        MANUAL = 3
 
         def to_fee_method(self) -> 'FeeMethod':
             return {
                 self.FEERATE: FeeMethod.FEERATE,
                 self.ETA: FeeMethod.ETA,
                 self.MEMPOOL: FeeMethod.MEMPOOL,
+                self.MANUAL: FeeMethod.FIXED
             }[self]
 
         @classmethod
@@ -47,6 +53,7 @@ class FeeSlider(QObject):
                 FeeMethod.FEERATE: cls.FEERATE,
                 FeeMethod.ETA: cls.ETA,
                 FeeMethod.MEMPOOL: cls.MEMPOOL,
+                FeeMethod.FIXED: cls.MANUAL
             }[fm]
 
     def __init__(self, parent=None):
@@ -55,17 +62,19 @@ class FeeSlider(QObject):
         self._wallet = None  # type: Optional[QEWallet]
         self._sliderSteps = 0
         self._sliderPos = 0
+        self._fee_method = None  # type: Optional[FeeSlider.FSMethod]
         self._fee_policy = None  # type: Optional[FeePolicy]
         self._target = ''
         self._config = None  # type: Optional[SimpleConfig]
 
     walletChanged = pyqtSignal()
-    @pyqtProperty(QEWallet, notify=walletChanged)
-    def wallet(self):
+    @pyqtProperty(QVariant, notify=walletChanged)
+    def wallet(self) -> QEWallet:
         return self._wallet
 
     @wallet.setter
     def wallet(self, wallet: QEWallet):
+        assert wallet is None or isinstance(wallet, QEWallet)
         if self._wallet != wallet:
             self._wallet = wallet
             self._config = self._wallet.wallet.config
@@ -97,10 +106,9 @@ class FeeSlider(QObject):
 
     @method.setter
     def method(self, method: int):
-        fsmethod = self.FSMethod(method)
-        method = fsmethod.to_fee_method()
-        if self._fee_policy.method != method:
-            self._fee_policy.set_method(method)
+        if self._fee_method != FeeSlider.FSMethod(method):
+            self._fee_method = self.FSMethod(method)
+            self._fee_policy.set_method(self._fee_method.to_fee_method())
             self.update_slider()
             self.methodChanged.emit()
             self.save_config()
@@ -117,6 +125,8 @@ class FeeSlider(QObject):
             self.targetChanged.emit()
 
     def update_slider(self):
+        if self._fee_method == FeeSlider.FSMethod.MANUAL:
+            return
         self._sliderSteps = self._fee_policy.get_slider_max()
         self._sliderPos = self._fee_policy.get_slider_pos()
         self.sliderStepsChanged.emit()
@@ -127,16 +137,16 @@ class FeeSlider(QObject):
 
     def read_config(self):
         self._fee_policy = FeePolicy(self._config.FEE_POLICY)
+        self._fee_method = self.FSMethod.from_fee_method(self._fee_policy.method)
         self.update_slider()
         self.methodChanged.emit()
-        self.update_target()
         self.update()
 
     def save_config(self):
-        value = int(self._sliderPos)
-        self._fee_policy.set_value_from_slider_pos(value)
-        self._config.FEE_POLICY = self._fee_policy.get_descriptor()
-        self.update_target()
+        if self._fee_method != FeeSlider.FSMethod.MANUAL:
+            value = int(self._sliderPos)
+            self._fee_policy.set_value_from_slider_pos(value)
+            self._config.FEE_POLICY = self._fee_policy.get_descriptor()
         self.update()
 
     def update(self):
@@ -149,6 +159,9 @@ class TxFeeSlider(FeeSlider):
 
         self._fee = QEAmount()
         self._feeRate = ''
+        self._userFee = ''
+        self._userFeerate = ''
+        self._is_user_feerate_last = True
         self._rbf = False
         self._tx = None  # type: Optional[PartialTransaction]
         self._inputs = []
@@ -158,12 +171,13 @@ class TxFeeSlider(FeeSlider):
         self._warning = ''
 
     feeChanged = pyqtSignal()
-    @pyqtProperty(QEAmount, notify=feeChanged)
-    def fee(self):
+    @pyqtProperty(QVariant, notify=feeChanged)
+    def fee(self) -> QEAmount:
         return self._fee
 
     @fee.setter
-    def fee(self, fee):
+    def fee(self, fee: QEAmount):
+        assert fee is None or isinstance(fee, QEAmount)
         if self._fee != fee:
             self._fee.copyFrom(fee)
             self.feeChanged.emit()
@@ -178,6 +192,50 @@ class TxFeeSlider(FeeSlider):
         if self._feeRate != feeRate:
             self._feeRate = feeRate
             self.feeRateChanged.emit()
+
+    userFeeChanged = pyqtSignal()
+    @pyqtProperty(str, notify=userFeeChanged)
+    def userFee(self):
+        return self._userFee
+
+    @userFee.setter
+    def userFee(self, userFee):
+        if self._userFee != userFee:
+            self._logger.warn('userFee')
+            self._userFee = userFee
+            user_fee = int(userFee) if userFee else 0
+            self._fee_policy = FeePolicy(f'fixed:{user_fee}')
+            self.userFeeChanged.emit()
+            self.isUserFeerateLast = False
+            self.update()
+
+    userFeerateChanged = pyqtSignal()
+    @pyqtProperty(str, notify=userFeerateChanged)
+    def userFeerate(self):
+        return self._userFeerate
+
+    @userFeerate.setter
+    def userFeerate(self, userFeerate):
+        if self._userFeerate != userFeerate:
+            self._logger.warn('userFeerate')
+            self._userFeerate = userFeerate
+            as_decimal = Decimal(userFeerate) if userFeerate else 0
+            user_feerate = int(as_decimal * 1000)
+            self._fee_policy = FeePolicy(f'feerate:{user_feerate}')
+            self.userFeerateChanged.emit()
+            self.isUserFeerateLast = True
+            self.update()
+
+    isUserFeerateLastChanged = pyqtSignal()
+    @pyqtProperty(bool, notify=isUserFeerateLastChanged)
+    def isUserFeerateLast(self):
+        return self._is_user_feerate_last
+
+    @isUserFeerateLast.setter
+    def isUserFeerateLast(self, isUserFeerateLast):
+        if self._is_user_feerate_last != isUserFeerateLast:
+            self._is_user_feerate_last = isUserFeerateLast
+            self.isUserFeerateLastChanged.emit()
 
     rbfChanged = pyqtSignal()
     @pyqtProperty(bool, notify=rbfChanged)
@@ -255,6 +313,17 @@ class TxFeeSlider(FeeSlider):
 
         self.update_inputs_from_tx(tx)
         self.update_outputs_from_tx(tx)
+        self.update_target()
+        self.update_manual_fields()
+
+    def update_manual_fields(self):
+        if self._fee_method == FeeSlider.FSMethod.MANUAL:
+            if self._fee_policy.method == FeeMethod.FIXED:
+                self._userFeerate = self.feeRate
+                self.userFeerateChanged.emit()
+            else:
+                self._userFee = self.fee.satsStr
+                self.userFeeChanged.emit()
 
     def update_inputs_from_tx(self, tx: Transaction):
         inputs = []
@@ -308,6 +377,14 @@ class TxFeeSlider(FeeSlider):
         else:
             self.warning = ''
 
+    def save_config(self):
+        if self._fee_method == FeeSlider.FSMethod.MANUAL:
+            if self.fee:
+                self.userFee = self.fee.satsStr
+            if self.feeRate:
+                self.userFeerate = self.feeRate
+        super().save_config()
+
 
 class QETxFinalizer(TxFeeSlider):
     _logger = get_logger(__name__)
@@ -344,12 +421,13 @@ class QETxFinalizer(TxFeeSlider):
             self.addressChanged.emit()
 
     amountChanged = pyqtSignal()
-    @pyqtProperty(QEAmount, notify=amountChanged)
-    def amount(self):
+    @pyqtProperty(QVariant, notify=amountChanged)
+    def amount(self) -> QEAmount:
         return self._amount
 
     @amount.setter
-    def amount(self, amount):
+    def amount(self, amount: QEAmount):
+        assert amount is None or isinstance(amount, QEAmount)
         if self._amount != amount:
             self._logger.debug(str(amount))
             self._amount.copyFrom(amount)
@@ -361,12 +439,13 @@ class QETxFinalizer(TxFeeSlider):
         return self._effectiveAmount
 
     extraFeeChanged = pyqtSignal()
-    @pyqtProperty(QEAmount, notify=extraFeeChanged)
-    def extraFee(self):
+    @pyqtProperty(QVariant, notify=extraFeeChanged)
+    def extraFee(self) -> QEAmount:
         return self._extraFee
 
     @extraFee.setter
-    def extraFee(self, extrafee):
+    def extraFee(self, extrafee: QEAmount):
+        assert extrafee is None or isinstance(extrafee, QEAmount)
         if self._extraFee != extrafee:
             self._extraFee.copyFrom(extrafee)
             self.extraFeeChanged.emit()
@@ -414,6 +493,11 @@ class QETxFinalizer(TxFeeSlider):
             tx = self.make_tx(amount=amount)
         except NotEnoughFunds:
             self.warning = self._wallet.wallet.get_text_not_enough_funds_mentioning_frozen(for_amount=amount)
+            self._valid = False
+            self.validChanged.emit()
+            return
+        except NoDynamicFeeEstimates:
+            self.warning = _('No dynamic fee estimates available')
             self._valid = False
             self.validChanged.emit()
             return
@@ -579,19 +663,20 @@ class QETxRbfFeeBumper(TxFeeSlider, TxMonMixin):
         super().__init__(parent)
 
         self._oldfee = QEAmount()
-        self._oldfee_rate = 0
+        self._oldfee_rate = '0'
         self._orig_tx = None
         self._rbf = True
         self._bump_method = BumpFeeStrategy.PRESERVE_PAYMENT.name
         self._bump_methods_available = []
 
     oldfeeChanged = pyqtSignal()
-    @pyqtProperty(QEAmount, notify=oldfeeChanged)
-    def oldfee(self):
+    @pyqtProperty(QVariant, notify=oldfeeChanged)
+    def oldfee(self) -> QEAmount:
         return self._oldfee
 
     @oldfee.setter
-    def oldfee(self, oldfee):
+    def oldfee(self, oldfee: QEAmount):
+        assert oldfee is None or isinstance(oldfee, QEAmount)
         if self._oldfee != oldfee:
             self._oldfee.copyFrom(oldfee)
             self.oldfeeChanged.emit()
@@ -661,12 +746,16 @@ class QETxRbfFeeBumper(TxFeeSlider, TxMonMixin):
             # not initialized yet
             return
 
-        fee_per_kb = self._fee_policy.fee_per_kb(self._wallet.wallet.network)
-        if fee_per_kb is None:
-            # dynamic method and no network
-            self._logger.debug('no fee_per_kb')
-            self.warning = _('Cannot determine dynamic fees, not connected')
-            return
+        if self._fee_policy.method == FeeMethod.FIXED:
+            fee = self._fee_policy.value
+            fee_per_kb = 1000 * fee / self._orig_tx.estimated_size()
+        else:
+            fee_per_kb = self._fee_policy.fee_per_kb(self._wallet.wallet.network)
+            if fee_per_kb is None:
+                # dynamic method and no network
+                self._logger.debug('no fee_per_kb')
+                self.warning = _('Cannot determine dynamic fees, not connected')
+                return
 
         new_fee_rate = fee_per_kb / 1000
         if new_fee_rate <= float(self._oldfee_rate):
@@ -674,6 +763,13 @@ class QETxRbfFeeBumper(TxFeeSlider, TxMonMixin):
             self.validChanged.emit()
             self.warning = _("The new fee rate needs to be higher than the old fee rate.")
             return
+
+        if not self._orig_tx.add_info_from_wallet_and_network(wallet=self._wallet.wallet, show_error=self._logger.error):
+            self._valid = False
+            self.validChanged.emit()
+            self.warning = _("Transaction is missing info from network")
+            return
+
         try:
             self._tx = self._wallet.wallet.bump_fee(
                 tx=self._orig_tx,
@@ -709,18 +805,19 @@ class QETxCanceller(TxFeeSlider, TxMonMixin):
         super().__init__(parent)
 
         self._oldfee = QEAmount()
-        self._oldfee_rate = 0
+        self._oldfee_rate = '0'
         self._orig_tx = None
         self._txid = ''
         self._rbf = True
 
     oldfeeChanged = pyqtSignal()
-    @pyqtProperty(QEAmount, notify=oldfeeChanged)
-    def oldfee(self):
+    @pyqtProperty(QVariant, notify=oldfeeChanged)
+    def oldfee(self) -> QEAmount:
         return self._oldfee
 
     @oldfee.setter
-    def oldfee(self, oldfee):
+    def oldfee(self, oldfee: QEAmount):
+        assert oldfee is None or isinstance(oldfee, QEAmount)
         if self._oldfee != oldfee:
             self._oldfee.copyFrom(oldfee)
             self.oldfeeChanged.emit()
@@ -768,18 +865,35 @@ class QETxCanceller(TxFeeSlider, TxMonMixin):
             # not initialized yet
             return
 
-        fee_per_kb = self._fee_policy.fee_per_kb(self._wallet.wallet.network)
-        if fee_per_kb is None:
-            # dynamic method and no network
-            self._logger.debug('no fee_per_kb')
-            self.warning = _('Cannot determine dynamic fees, not connected')
-            return
+        if self._fee_policy.method == FeeMethod.FIXED:
+            fee = self._fee_policy.value
+            fee_per_kb = 1000 * fee / self._orig_tx.estimated_size()
+        else:
+            fee_per_kb = self._fee_policy.fee_per_kb(self._wallet.wallet.network)
+            if fee_per_kb is None:
+                # dynamic method and no network
+                self._logger.debug('no fee_per_kb')
+                self.warning = _('Cannot determine dynamic fees, not connected')
+                return
 
         new_fee_rate = fee_per_kb / 1000
         if new_fee_rate <= float(self._oldfee_rate):
             self._valid = False
             self.validChanged.emit()
             self.warning = _("The new fee rate needs to be higher than the old fee rate.")
+            return
+
+        if fee_per_kb < self._wallet.wallet.relayfee():
+            self._valid = False
+            self.validChanged.emit()
+            self._logger.warning('feerate too low for relay')
+            self.warning = messages.MSG_RELAYFEE
+            return
+
+        if not self._orig_tx.add_info_from_wallet_and_network(wallet=self._wallet.wallet, show_error=self._logger.error):
+            self._valid = False
+            self.validChanged.emit()
+            self.warning = _("Transaction is missing info from network")
             return
 
         try:
@@ -830,12 +944,13 @@ class QETxCpfpFeeBumper(TxFeeSlider, TxMonMixin):
         self._rbf = True
 
     totalFeeChanged = pyqtSignal()
-    @pyqtProperty(QEAmount, notify=totalFeeChanged)
-    def totalFee(self):
+    @pyqtProperty(QVariant, notify=totalFeeChanged)
+    def totalFee(self) -> QEAmount:
         return self._total_fee
 
     @totalFee.setter
-    def totalFee(self, totalfee):
+    def totalFee(self, totalfee: QEAmount):
+        assert totalfee is None or isinstance(totalfee, QEAmount)
         if self._total_fee != totalfee:
             self._total_fee.copyFrom(totalfee)
             self.totalFeeChanged.emit()
@@ -895,11 +1010,11 @@ class QETxCpfpFeeBumper(TxFeeSlider, TxMonMixin):
         if fee_per_kb is None:
             return None
         package_fee = FeePolicy.estimate_fee_for_feerate(fee_per_kb=fee_per_kb, size=self._total_size)
-        child_fee = package_fee - self._parent_fee
+        return self.get_child_fee_from_total_fee(package_fee)
+
+    def get_child_fee_from_total_fee(self, fee: int) -> int:
+        child_fee = fee - self._parent_fee
         child_fee = min(self._max_fee, child_fee)
-        # pay at least minrelayfee for combined size:
-        min_child_fee = FeePolicy.estimate_fee_for_feerate(fee_per_kb=self._wallet.wallet.relayfee(), size=self._total_size)
-        child_fee = max(min_child_fee, child_fee)
         return child_fee
 
     def tx_verified(self):
@@ -922,19 +1037,21 @@ class QETxCpfpFeeBumper(TxFeeSlider, TxMonMixin):
         self.validChanged.emit()
         self.warning = ''
 
-        fee_per_kb = self._fee_policy.fee_per_kb(self._wallet.wallet.network)
-        if fee_per_kb is None:
-            # dynamic method and no network
-            self._logger.debug('no fee_per_kb')
-            self.warning = _('Cannot determine dynamic fees, not connected')
-            return
-
         if self._parent_fee is None:
             self._logger.error(_("Can't CPFP: unknown fee for parent transaction."))
             self.warning = _("Can't CPFP: unknown fee for parent transaction.")
             return
 
-        fee = self.get_child_fee_from_total_feerate(fee_per_kb=fee_per_kb)
+        if self._fee_policy.method == FeeMethod.FIXED:
+            fee = self.get_child_fee_from_total_fee(self._fee_policy.value)
+        else:
+            fee_per_kb = self._fee_policy.fee_per_kb(self._wallet.wallet.network)
+            if fee_per_kb is None:
+                # dynamic method and no network
+                self._logger.debug('no fee_per_kb')
+                self.warning = _('Cannot determine dynamic fees, not connected')
+                return
+            fee = self.get_child_fee_from_total_feerate(fee_per_kb=fee_per_kb)
 
         if fee is None:
             self._logger.warning('no fee')
@@ -944,9 +1061,19 @@ class QETxCpfpFeeBumper(TxFeeSlider, TxMonMixin):
             self._logger.warning('max fee exceeded')
             self.warning = _('Max fee exceeded')
             return
+        min_child_fee = FeePolicy.estimate_fee_for_feerate(fee_per_kb=self._wallet.wallet.relayfee(), size=self._total_size)
+        if fee < min_child_fee:
+            self._logger.warning('feerate too low for relay')
+            self.warning = messages.MSG_RELAYFEE
+            return
 
         comb_fee = fee + self._parent_fee
         comb_feerate = comb_fee / self._total_size
+
+        if comb_feerate < (self._parent_fee / self._parent_tx_size):
+            self._logger.debug('combined feerate below parent tx feerate')
+            self.warning = _('Combined feerate should be greater than the parent tx feerate')
+            return
 
         self._fee.satsInt = fee
         self._output_amount.satsInt = self._max_fee - fee
@@ -967,9 +1094,20 @@ class QETxCpfpFeeBumper(TxFeeSlider, TxMonMixin):
 
         self.update_inputs_from_tx(self._new_tx)
         self.update_outputs_from_tx(self._new_tx)
+        self.update_target()
+        self.update_manual_fields()
 
         self._valid = True
         self.validChanged.emit()
+
+    def update_manual_fields(self):
+        if self._fee_method == FeeSlider.FSMethod.MANUAL:
+            if self._fee_policy.method == FeeMethod.FIXED:
+                self._userFeerate = self._total_fee_rate
+                self.userFeerateChanged.emit()
+            else:
+                self._userFee = self._total_fee.satsStr
+                self.userFeeChanged.emit()
 
     @pyqtSlot(result=str)
     def getNewTx(self):
@@ -1010,7 +1148,8 @@ class QETxSweepFinalizer(QETxFinalizer):
         coins, keypairs = copy.deepcopy(self._txins)
         outputs = [PartialTxOutput.from_address_and_value(address, value='!')]
 
-        tx = self._wallet.wallet.make_unsigned_transaction(coins=coins, outputs=outputs, fee=None, rbf=self._rbf, is_sweep=True)
+        tx = self._wallet.wallet.make_unsigned_transaction(
+            coins=coins, outputs=outputs, fee_policy=self._fee_policy, rbf=self._rbf, is_sweep=True)
         self._logger.debug('fee: %d, inputs: %d, outputs: %d' % (tx.get_fee(), len(tx.inputs()), len(tx.outputs())))
 
         tx.sign(keypairs)
@@ -1047,9 +1186,13 @@ class QETxSweepFinalizer(QETxFinalizer):
         try:
             # make unsigned transaction
             tx = self.make_sweep_tx()
-        except Exception as e:
-            self._logger.error(str(e))
-            self.warning = repr(e)
+        except NoDynamicFeeEstimates:
+            self.warning = _('No dynamic fee estimates available')
+            self._valid = False
+            self.validChanged.emit()
+            return
+        except NotEnoughFunds:
+            self.warning = _('Not enough funds')
             self._valid = False
             self.validChanged.emit()
             return

@@ -76,7 +76,7 @@ requirements =
     plyer,
     libffi,
     libsecp256k1,
-    cryptography,
+    pycryptodomex,
     pyqt6sip,
     pyqt6,
     libzbar
@@ -101,23 +101,23 @@ fullscreen = False
 #
 
 # (list) Permissions
-android.permissions = INTERNET, CAMERA, WRITE_EXTERNAL_STORAGE, POST_NOTIFICATIONS
+android.permissions = INTERNET, CAMERA, WRITE_EXTERNAL_STORAGE, POST_NOTIFICATIONS, USE_BIOMETRIC
 
 # (int) Android API to use  (compileSdkVersion)
 # note: when changing, Dockerfile also needs to be changed to install corresponding build tools
-android.api = 31
+android.api = 35
 
 # (int) Android targetSdkVersion
 android.target_sdk_version = 35
 
 # (int) Minimum API required. You will need to set the android.ndk_api to be as low as this value.
-android.minapi = 23
+android.minapi = 26
 
 # (str) Android NDK version to use
-android.ndk = 23b
+android.ndk = 28c
 
 # (int) Android NDK API to use (optional). This is the minimum API your app will support.
-android.ndk_api = 23
+android.ndk_api = 26
 
 # (bool) Use --private data storage (True) or --dir public storage (False)
 #android.private_storage = True
@@ -168,10 +168,10 @@ android.add_src = electrum/gui/qml/java_classes/
 
 # kotlin-stdlib is required for zxing-cpp (BarcodeScannerView)
 android.gradle_dependencies =
-    com.android.support:support-compat:28.0.0,
+    androidx.core:core:1.16.0,
     org.jetbrains.kotlin:kotlin-stdlib:1.8.22
 
-android.add_activities = org.electrum.qr.SimpleScannerActivity
+android.add_activities = org.electrum.qr.SimpleScannerActivity, org.electrum.biometry.BiometricActivity
 
 # (list) Put these files or directories in the apk res directory.
 # The option may be used in three ways, the value may contain one or zero ':'

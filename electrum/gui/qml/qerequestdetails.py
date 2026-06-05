@@ -2,21 +2,23 @@ from enum import IntEnum
 from typing import Optional
 from urllib.parse import urlparse
 
-from PyQt6.QtCore import pyqtProperty, pyqtSignal, pyqtSlot, QObject, QTimer, pyqtEnum
+from PyQt6.QtCore import pyqtProperty, pyqtSignal, pyqtSlot, QObject, QTimer, pyqtEnum, QVariant
 
 from electrum.logging import get_logger
 from electrum.invoices import (
     PR_UNPAID, PR_EXPIRED, PR_UNKNOWN, PR_PAID, PR_INFLIGHT, PR_FAILED, PR_ROUTING, PR_UNCONFIRMED, LN_EXPIRY_NEVER
 )
-from electrum.lnutil import MIN_FUNDING_SAT
+from electrum.lnutil import MIN_FUNDING_SAT, RECEIVED
 from electrum.lnurl import LNURL3Data, request_lnurl_withdraw_callback, LNURLError
 from electrum.payment_identifier import PaymentIdentifier, PaymentIdentifierType
 from electrum.i18n import _
 from electrum.network import Network
 
+from electrum.gui.common_qt.util import QtEventListener, qt_event_listener
+
 from .qewallet import QEWallet
 from .qetypes import QEAmount
-from .util import QtEventListener, event_listener, status_update_timer_interval
+from .util import status_update_timer_interval
 
 
 class QERequestDetails(QObject, QtEventListener):
@@ -65,19 +67,20 @@ class QERequestDetails(QObject, QtEventListener):
             self._timer.stop()
             self._timer = None
 
-    @event_listener
+    @qt_event_listener
     def on_event_request_status(self, wallet, key, status):
-        if wallet == self._wallet.wallet and key == self._key:
+        if self._wallet and wallet == self._wallet.wallet and key == self._key:
             self._logger.debug('request status %d for key %s' % (status, key))
             self.statusChanged.emit()
 
     walletChanged = pyqtSignal()
-    @pyqtProperty(QEWallet, notify=walletChanged)
-    def wallet(self):
+    @pyqtProperty(QVariant, notify=walletChanged)
+    def wallet(self) -> QEWallet:
         return self._wallet
 
     @wallet.setter
     def wallet(self, wallet: QEWallet):
+        assert wallet is None or isinstance(wallet, QEWallet)
         if self._wallet != wallet:
             self._wallet = wallet
             self.walletChanged.emit()
@@ -237,7 +240,7 @@ class QERequestDetails(QObject, QtEventListener):
                 address=None,
             )
             req = self._wallet.wallet.get_request(key)
-            info = self._wallet.wallet.lnworker.get_payment_info(req.payment_hash)
+            info = self._wallet.wallet.lnworker.get_payment_info(req.payment_hash, direction=RECEIVED)
             _lnaddr, b11_invoice = self._wallet.wallet.lnworker.get_bolt11_invoice(
                 payment_info=info,
                 message=req.get_message(),

@@ -21,6 +21,7 @@
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 import concurrent.futures
+import copy
 from dataclasses import dataclass
 import logging
 import os
@@ -28,6 +29,7 @@ import sys
 import re
 from collections import defaultdict, OrderedDict
 from concurrent.futures.process import ProcessPoolExecutor
+import typing
 from typing import (
     NamedTuple, Union, TYPE_CHECKING, Tuple, Optional, Callable, Any, Sequence, Dict, Generic, TypeVar, List, Iterable,
     Set, Awaitable
@@ -56,6 +58,7 @@ import enum
 from contextlib import nullcontext, suppress
 import traceback
 import inspect
+import weakref
 
 import aiohttp
 from aiohttp_socks import ProxyConnector, ProxyType
@@ -331,7 +334,7 @@ class MyEncoder(json.JSONEncoder):
         if isinstance(obj, datetime):
             # note: if there is a timezone specified, this will include the offset
             return obj.isoformat(' ', timespec="minutes")
-        if isinstance(obj, set):
+        if isinstance(obj, (set, frozenset)):
             return list(obj)
         if isinstance(obj, bytes): # for nametuples in lnchannel
             return obj.hex()
@@ -352,35 +355,6 @@ class ThreadJob(Logger):
         """Called periodically from the thread"""
         pass
 
-class DebugMem(ThreadJob):
-    '''A handy class for debugging GC memory leaks'''
-    def __init__(self, classes, interval=30):
-        ThreadJob.__init__(self)
-        self.next_time = 0
-        self.classes = classes
-        self.interval = interval
-
-    def mem_stats(self):
-        import gc
-        self.logger.info("Start memscan")
-        gc.collect()
-        objmap = defaultdict(list)
-        for obj in gc.get_objects():
-            for class_ in self.classes:
-                try:
-                    _isinstance = isinstance(obj, class_)
-                except AttributeError:
-                    _isinstance = False
-                if _isinstance:
-                    objmap[class_].append(obj)
-        for class_, objs in objmap.items():
-            self.logger.info(f"{class_.__name__}: {len(objs)}")
-        self.logger.info("Finish memscan")
-
-    def run(self):
-        if time.time() > self.next_time:
-            self.mem_stats()
-            self.next_time = time.time() + self.interval
 
 class DaemonThread(threading.Thread, Logger):
     """ daemon thread that terminates cleanly """
@@ -407,10 +381,14 @@ class DaemonThread(threading.Thread, Logger):
         # malformed or malicious server responses
         with self.job_lock:
             for job in self.jobs:
+                start = time.perf_counter()
                 try:
                     job.run()
                 except Exception as e:
                     self.logger.exception('')
+                duration = time.perf_counter() - start
+                if duration > 0.5:
+                    self.logger.warning(f"thread job {job} blocked {self} DaemonThread for {duration:.2f} s")
 
     def remove_jobs(self, jobs):
         with self.job_lock:
@@ -891,6 +869,7 @@ UI_UNIT_NAME_FEERATE_SAT_PER_VBYTE = "sat/vbyte"
 UI_UNIT_NAME_FEERATE_SAT_PER_VB = "sat/vB"
 UI_UNIT_NAME_TXSIZE_VBYTES = "vbytes"
 UI_UNIT_NAME_MEMPOOL_MB = "vMB"
+UI_UNIT_NAME_FIXED_SAT = "sat"
 
 
 def format_fee_satoshis(fee, *, num_zeros=0, precision=None):
@@ -920,6 +899,10 @@ def timestamp_to_datetime(timestamp: Union[int, float, None], *, utc: bool = Fal
 def format_time(timestamp: Union[int, float, None]) -> str:
     date = timestamp_to_datetime(timestamp)
     return date.isoformat(' ', timespec="minutes") if date else _("Unknown")
+
+
+def now() -> int:
+    return int(time.time())
 
 
 def age(
@@ -1200,7 +1183,7 @@ def make_dir(path, *, allow_symlink=True):
     """
     if not os.path.exists(path):
         if not allow_symlink and os.path.islink(path):
-            raise Exception('Dangling link: ' + path)
+            raise FileNotFoundError('Dangling link: ' + path)
         try:
             os.mkdir(path)
         except FileExistsError:
@@ -1876,6 +1859,36 @@ class OrderedDictWithIndex(OrderedDict):
         return ret
 
 
+T = typing.TypeVar("T")
+
+class OrderedSet(typing.MutableSet[T]):
+    """A set that preserves insertion order by internally using a dict."""
+
+    def __init__(self, iterable: typing.Iterable[T] = ()):
+        self._d = dict.fromkeys(iterable)
+
+    def add(self, value: T) -> None:
+        self._d[value] = None
+
+    def discard(self, value: T) -> None:
+        self._d.pop(value, None)
+
+    def __contains__(self, value: object) -> bool:
+        return self._d.__contains__(value)
+
+    def __len__(self) -> int:
+        return self._d.__len__()
+
+    def __iter__(self) -> typing.Iterator[T]:
+        return self._d.__iter__()
+
+    def __str__(self):
+        return f"{{{', '.join(str(i) for i in self)}}}"
+
+    def __repr__(self):
+        return f"<OrderedSet {self}>"
+
+
 def make_object_immutable(obj):
     """Makes the passed object immutable recursively."""
     allowed_types = (
@@ -1980,23 +1993,40 @@ class CallbackManager(Logger):
 
     def __init__(self):
         Logger.__init__(self)
-        self.callback_lock = threading.Lock()
-        self.callbacks = defaultdict(list)  # type: Dict[str, List[Callable]]  # note: needs self.callback_lock
+        self.callback_lock = threading.RLock()
+        self._wcallbacks = defaultdict(set)  # type: Dict[str, Set[weakref.ref[Callable]]]  # note: needs self.callback_lock
 
-    def register_callback(self, func: Callable, events: Sequence[str]) -> None:
+    @staticmethod
+    def _wcb_from_any_callback(cb: Callable) -> weakref.ref[Callable]:
+        assert callable(cb), type(cb)
+        if isinstance(cb, weakref.ref):  # no-op
+            return cb
+        elif inspect.ismethod(cb):  # instance method, such as for a subclass of EventListener
+            return WeakMethodProper(cb)
+        else:  # proper function? e.g. used by lnpeer unit tests
+            return weakref.ref(cb)
+
+    def register_callback(self, cb: Callable, events: Sequence[str]) -> None:
+        wcb = self._wcb_from_any_callback(cb)
         with self.callback_lock:
             for event in events:
-                self.callbacks[event].append(func)
+                self._wcallbacks[event].add(wcb)
 
-    def unregister_callback(self, callback: Callable) -> None:
+    def unregister_callback(self, cb: Callable) -> None:
+        wcb = self._wcb_from_any_callback(cb)
         with self.callback_lock:
-            for callbacks in self.callbacks.values():
-                if callback in callbacks:
-                    callbacks.remove(callback)
+            # note: ^ callback_lock needs to be re-entrant, as we can now trigger __del__, which also takes the lock
+            for callbacks in self._wcallbacks.values():
+                if wcb in callbacks:
+                    callbacks.remove(wcb)
+
+    def count_all_callbacks(self) -> int:
+        with self.callback_lock:
+            return sum(len(cbs) for cbs in self._wcallbacks.values())
 
     def clear_all_callbacks(self) -> None:
         with self.callback_lock:
-            self.callbacks.clear()
+            self._wcallbacks.clear()
 
     def trigger_callback(self, event: str, *args) -> None:
         """Trigger a callback with given arguments.
@@ -2006,8 +2036,11 @@ class CallbackManager(Logger):
         loop = get_asyncio_loop()
         assert loop.is_running(), "event loop not running"
         with self.callback_lock:
-            callbacks = self.callbacks[event][:]
-        for callback in callbacks:
+            wcallbacks = copy.copy(self._wcallbacks[event])
+        for wcb in wcallbacks:
+            callback = wcb()
+            if callback is None:
+                continue
             if inspect.iscoroutinefunction(callback):  # async cb
                 fut = asyncio.run_coroutine_threadsafe(callback(*args), loop)
 
@@ -2029,11 +2062,28 @@ unregister_callback = callback_mgr.unregister_callback
 _event_listeners = defaultdict(set)  # type: Dict[str, Set[str]]
 
 
+class WeakMethodProper(weakref.WeakMethod):
+    """Unlike weakref.WeakMethod, this class has an __eq__ I can trust."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        meth = self()
+        self._my_id = (id(meth.__self__), id(meth.__func__))
+
+    def __hash__(self):
+        return hash(self._my_id)
+
+    def __eq__(self, other):
+        if not isinstance(other, WeakMethodProper):
+            return False
+        return self._my_id == other._my_id
+
+
 class EventListener:
     """Use as a mixin for a class that has methods to be triggered on events.
     - Methods that receive the callbacks should be named "on_event_*" and decorated with @event_listener.
-    - register_callbacks() should be called exactly once per instance of EventListener, e.g. in __init__
+    - register_callbacks() should be called once per instance of EventListener, e.g. in __init__
     - unregister_callbacks() should be called at least once, e.g. when the instance is destroyed
+        - as fallback, __del__() also calls unregister_callbacks()
     """
 
     def _list_callbacks(self):
@@ -2054,6 +2104,9 @@ class EventListener:
         for name, method in self._list_callbacks():
             #_logger.debug(f'unregistering callback {method}')
             unregister_callback(method)
+
+    def __del__(self):
+        self.unregister_callbacks()
 
 
 def event_listener(func):
@@ -2152,6 +2205,7 @@ class ESocksProxy(aiorpcx.SOCKSProxy):
         username, pw = proxy.user, proxy.password
         if not username or not pw:
             # is_proxy_tor is tri-state; None indicates it is still probing the proxy to test for TOR
+            # FIXME race: if is_proxy_tor is None, we should wait until it gets set. Instead now we reuse Tor circuits.
             if network.is_proxy_tor:
                 auth = aiorpcx.socks.SOCKSRandomAuth()
             else:

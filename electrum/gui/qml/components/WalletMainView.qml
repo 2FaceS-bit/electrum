@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Controls.Material
+import QtQuick.Controls.Material.impl
 import QtQml
 
 import org.electrum 1.0
@@ -11,10 +12,9 @@ import "controls"
 Item {
     id: mainView
 
-    property string title: Daemon.currentWallet ? Daemon.currentWallet.name : qsTr('no wallet loaded')
+    property string title: Daemon.currentWallet.name
 
     property var _sendDialog
-    property string _intentUri
 
     property string _request_amount
     property string _request_description
@@ -188,7 +188,7 @@ Item {
             icon.source: '../../icons/wallet.png'
             action: Action {
                 text: qsTr('Wallet details')
-                enabled: Daemon.currentWallet && app.stack.currentItem.objectName != 'WalletDetails'
+                enabled: app.stack.currentItem.objectName != 'WalletDetails'
                 onTriggered: menu.openPage(Qt.resolvedUrl('WalletDetails.qml'))
             }
         }
@@ -198,7 +198,7 @@ Item {
             action: Action {
                 text: qsTr('Addresses/Coins');
                 onTriggered: menu.openPage(Qt.resolvedUrl('Addresses.qml'));
-                enabled: Daemon.currentWallet && app.stack.currentItem.objectName != 'Addresses'
+                enabled: app.stack.currentItem.objectName != 'Addresses'
             }
         }
         MenuItem {
@@ -206,7 +206,7 @@ Item {
             icon.source: '../../icons/lightning.png'
             action: Action {
                 text: qsTr('Channels');
-                enabled: Daemon.currentWallet && Daemon.currentWallet.isLightning && app.stack.currentItem.objectName != 'Channels'
+                enabled: Daemon.currentWallet.isLightning && app.stack.currentItem.objectName != 'Channels'
                 onTriggered: menu.openPage(Qt.resolvedUrl('Channels.qml'))
             }
         }
@@ -285,53 +285,8 @@ Item {
 
         History {
             id: history
-            visible: Daemon.currentWallet
             Layout.fillWidth: true
             Layout.fillHeight: true
-        }
-
-        ColumnLayout {
-            Layout.alignment: Qt.AlignHCenter
-            Layout.fillHeight: true
-            spacing: 2*constants.paddingXLarge
-            visible: !Daemon.currentWallet
-
-            Item {
-                Layout.fillHeight: true
-            }
-            Label {
-                Layout.alignment: Qt.AlignHCenter
-                text: qsTr('No wallet loaded')
-                font.pixelSize: constants.fontSizeXXLarge
-            }
-
-            Pane {
-                Layout.alignment: Qt.AlignHCenter
-                padding: 0
-                background: Rectangle {
-                    color: Material.dialogColor
-                }
-                FlatButton {
-                    text: qsTr('Open/Create Wallet')
-                    icon.source: '../../icons/wallet.png'
-                    onClicked: {
-                        if (Daemon.availableWallets.rowCount() > 0) {
-                            stack.push(Qt.resolvedUrl('Wallets.qml'))
-                        } else {
-                            var newww = app.newWalletWizard.createObject(app)
-                            newww.walletCreated.connect(function() {
-                                Daemon.availableWallets.reload()
-                                // and load the new wallet
-                                Daemon.loadWallet(newww.path, newww.wizard_data['password'])
-                            })
-                            newww.open()
-                        }
-                    }
-                }
-            }
-            Item {
-                Layout.fillHeight: true
-            }
         }
 
         ButtonContainer {
@@ -340,7 +295,6 @@ Item {
 
             FlatButton {
                 id: receiveButton
-                visible: Daemon.currentWallet
                 Layout.fillWidth: true
                 Layout.preferredWidth: 1
                 icon.source: '../../icons/tab_receive.png'
@@ -349,6 +303,7 @@ Item {
                     var dialog = receiveDetailsDialog.createObject(mainView)
                     dialog.open()
                 }
+                pressAndHoldIndicator: true
                 onPressAndHold: {
                     Config.userKnowsPressAndHold = true
                     Daemon.currentWallet.deleteExpiredRequests()
@@ -357,13 +312,13 @@ Item {
                 }
             }
             FlatButton {
-                visible: Daemon.currentWallet
                 Layout.fillWidth: true
                 Layout.preferredWidth: 1
                 icon.source: '../../icons/tab_send.png'
                 text: qsTr('Send')
                 enabled: !invoiceParser.busy && !piResolver.busy && !requestDetails.busy
                 onClicked: openSendDialog()
+                pressAndHoldIndicator: true
                 onPressAndHold: {
                     Config.userKnowsPressAndHold = true
                     app.stack.push(Qt.resolvedUrl('Invoices.qml'))
@@ -372,6 +327,7 @@ Item {
             }
         }
     }
+    property color navigationBarBackgroundColor: constants.highlightBackground
 
     PIResolver {
         id: piResolver
@@ -489,25 +445,22 @@ Item {
     }
 
     Connections {
-        target: AppController
-        function onUriReceived(uri) {
-            console.log('uri received: ' + uri)
-            if (!Daemon.currentWallet) {
-                console.log('No wallet open, deferring')
-                _intentUri = uri
+        target: Daemon
+        function onWalletLoaded() {
+            if (!Daemon.currentWallet) {  // wallet got deleted
+                app.stack.replaceRoot('Wallets.qml')
                 return
             }
-            piResolver.recipient = uri
+            infobanner.hide() // start hidden when switching wallets
         }
     }
 
     Connections {
-        target: Daemon
-        function onWalletLoaded() {
-            infobanner.hide() // start hidden when switching wallets
-            if (_intentUri) {
-                piResolver.recipient = _intentUri
-                _intentUri = ''
+        target: app
+        function onPendingIntentChanged() {
+            if (app.pendingIntent) {
+                piResolver.recipient = app.pendingIntent
+                app.pendingIntent = ""
             }
         }
     }
@@ -819,5 +772,12 @@ Item {
         }
     }
 
+    Component.onCompleted: {
+        console.log("WalletMainView completed: ", Daemon.currentWallet.name)
+        if (app.pendingIntent) {
+            piResolver.recipient = app.pendingIntent
+            app.pendingIntent = ""
+        }
+    }
 }
 

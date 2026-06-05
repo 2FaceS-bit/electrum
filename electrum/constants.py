@@ -23,6 +23,7 @@
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import copy
 import os
 import json
 from typing import Sequence, Tuple, Mapping, Type, List, Optional
@@ -57,6 +58,7 @@ def create_fallback_node_list(fallback_nodes_dict: dict[str, dict]) -> List[LNPe
 
 GIT_REPO_URL = "https://github.com/spesmilo/electrum"
 GIT_REPO_ISSUES_URL = "https://github.com/spesmilo/electrum/issues"
+RELEASE_NOTES_URL = "https://raw.githubusercontent.com/spesmilo/electrum/refs/heads/master/RELEASE-NOTES"
 BIP39_WALLET_FORMATS = read_json('bip39_wallet_formats.json')
 
 
@@ -99,7 +101,8 @@ class AbstractNet:
         if cls._cached_default_servers is None:
             default_file = {} if cls.TESTNET else None  # for mainnet we hard-fail if the file is missing.
             cls._cached_default_servers = read_json(os.path.join('chains', cls.NET_NAME, 'servers.json'), default_file)
-        return cls._cached_default_servers
+        d = cls._cached_default_servers
+        return copy.deepcopy(d)
 
     _cached_fallback_lnnodes = None
     @classproperty

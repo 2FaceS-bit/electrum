@@ -12,13 +12,16 @@ import aiohttp.client_exceptions
 
 from electrum import segwit_addr, util
 from electrum.segwit_addr import bech32_decode, Encoding, convertbits, bech32_encode
-from electrum.lnaddr import LnDecodeException, LnEncodeException
+from electrum.bolt11 import BOLT11DecodeException, BOLT11EncodeException
 from electrum.network import Network
 from electrum.logging import get_logger
 from electrum.i18n import _
 
 
 _logger = get_logger(__name__)
+
+
+SUPPORTED_LNURL_SCHEMES = ('lnurlp', 'lnurlw')
 
 
 class LNURLError(Exception): pass
@@ -44,11 +47,11 @@ def decode_lnurl(lnurl: str) -> str:
     hrp = decoded_bech32.hrp
     data = decoded_bech32.data
     if decoded_bech32.encoding is None:
-        raise LnDecodeException("Bad bech32 checksum")
+        raise BOLT11DecodeException("Bad bech32 checksum")
     if decoded_bech32.encoding != Encoding.BECH32:
-        raise LnDecodeException("Bad bech32 encoding: must be using vanilla BECH32")
+        raise BOLT11DecodeException("Bad bech32 encoding: must be using vanilla BECH32")
     if not hrp.startswith("lnurl"):
-        raise LnDecodeException("Does not start with lnurl")
+        raise BOLT11DecodeException("Does not start with lnurl")
     data = convertbits(data, 5, 8, False)
     url = bytes(data).decode("utf-8")
     return url
@@ -59,7 +62,7 @@ def encode_lnurl(url: str) -> str:
     try:
         url = url.encode("utf-8")
     except UnicodeError as e:
-        raise LnEncodeException("invalid url") from e
+        raise BOLT11EncodeException("invalid url") from e
     bech32_data = convertbits(url, 8, 5, True)
     assert bech32_data
     lnurl = bech32_encode(
@@ -179,7 +182,7 @@ def _parse_lnurl3_response(lnurl_response: dict) -> LNURL3Data:
         raise UntrustedLNURLError(f"Missing k1 value in LNURL3 response: {lnurl_response=}")
     default_description = lnurl_response.get('defaultDescription', '')
     try:
-        min_withdrawable_sat = int(lnurl_response['minWithdrawable']) // 1000
+        min_withdrawable_sat = int(lnurl_response['minWithdrawable'] or 0) // 1000
         max_withdrawable_sat = int(lnurl_response['maxWithdrawable']) // 1000
         assert max_withdrawable_sat >= min_withdrawable_sat, f"Invalid amounts: max < min amount"
         assert max_withdrawable_sat > 0, f"Invalid max amount: {max_withdrawable_sat} sat"

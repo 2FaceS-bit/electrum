@@ -10,10 +10,10 @@ Electrum.egg-info/
 *_trial_temp
 packages
 env/
+/.venv*/
 .buildozer
 .buildozer_*/
 bin/
-/app.fil
 .idea
 .mypy_cache
 .vscode
